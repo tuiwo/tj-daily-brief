@@ -1,1 +1,30 @@
+topic_cn: 功率半导体结温在线监测
+timezone: America/Los_Angeles
+send_hour_local: 8
 
+latest_days: 7
+top_latest: 3
+top_classic: 2
+top_reco: 3
+
+keywords:
+  - "junction temperature"
+  - "Tj"
+  - "online"
+  - "real-time"
+  - "monitoring"
+  - "estimation"
+  - "TSEP"
+  - "temperature sensitive electrical parameter"
+  - "Vce(sat)"
+  - "Vf"
+  - "Rds(on)"
+  - "electro-thermal"
+  - "thermal impedance"
+  - "IGBT"
+  - "SiC"
+  - "MOSFET"
+  - "power module"
+
+exclude_keywords:
+  - "photovoltaic"
