@@ -1,6 +1,6 @@
 topic_cn: 功率半导体结温在线监测
 timezone: America/Los_Angeles
-send_hour_local: 8
+send_hour_local: 21
 
 
 search_query: "junction temperature estimation online monitoring IGBT SiC power module"
