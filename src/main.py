@@ -565,7 +565,7 @@ def main():
     reco_s2 = enrich_s2(cfg, reco_s2_raw, "reco_s2")
     
     # 合并去重
-    reco_all = dedupe(reco_oa + reco_s2)
+    reco_all = dedupe(reco_s2 + reco_oa)
     
     # 轻微偏向 S2（因为更像“猜你喜欢”）；无 S2 数据也不影响
     for it in reco_all:
