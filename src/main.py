@@ -333,7 +333,7 @@ def fetch_s2_recommendations_from_seeds(cfg) -> list[dict]:
     if not positive:
         return []
 
-    url = "https://api.semanticscholar.org/recommendations/v1/papers"
+    url = "https://api.semanticscholar.org/recommendations/v1/papers/"
     params = {
         "fields": "title,abstract,year,citationCount,venue,externalIds,url",
         "limit": int(cfg.get("s2_limit", 20)),
@@ -346,6 +346,7 @@ def fetch_s2_recommendations_from_seeds(cfg) -> list[dict]:
 
     for attempt in range(retries + 1):
         try:
+            print(f"S2: start, positive={len(positive)}, negative={len(negative)}, limit={params['limit']}, has_key={bool((os.getenv('S2_API_KEY') or '').strip())}")
             r = requests.post(
                 url,
                 headers=s2_headers(),
@@ -366,6 +367,9 @@ def fetch_s2_recommendations_from_seeds(cfg) -> list[dict]:
 
             r.raise_for_status()
             data = r.json()
+            recs = data.get("recommendedPapers", []) or []
+            print(f"S2: ok, status={r.status_code}, recs={len(recs)}")
+            return recs
             return data.get("recommendedPapers", []) or []
 
         except Exception as e:
