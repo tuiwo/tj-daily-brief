@@ -7,6 +7,7 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+import json
 
 import requests
 import yaml
@@ -284,6 +285,105 @@ def fetch_recommendations_from_seeds(cfg, mailto: str) -> list[dict]:
     return recos
 
 
+
+# -------------------------
+# milestone C: wo API
+# -------------------------
+
+def s2_headers():
+    # 没 key 也能尝试；有 key 会更稳（官方建议使用 key） [oai_citation:4‡Semantic Scholar](https://www.semanticscholar.org/product/api%2Ftutorial?utm_source=chatgpt.com)
+    key = (os.getenv("S2_API_KEY") or "").strip()
+    h = {"Content-Type": "application/json"}
+    if key:
+        h["x-api-key"] = key
+    return h
+
+
+def doi_to_s2_pid(doi: str) -> str:
+    """
+    把 DOI 规范成 Semantic Scholar 推荐接口常用的 paperId 形式：DOI:10.xxxx/xxxx
+    """
+    d = (doi or "").strip()
+    d = d.replace("doi:", "").strip()
+    d = d.replace("https://doi.org/", "").strip()
+    d = d.replace("http://doi.org/", "").strip()
+    return f"DOI:{d}" if d else ""
+
+
+def fetch_s2_recommendations_from_seeds(cfg) -> list[dict]:
+    """
+    Semantic Scholar Recommendations API：
+      POST https://api.semanticscholar.org/recommendations/v1/papers
+    官方有 Recommendations API 文档。 [oai_citation:5‡语义学者](https://api.semanticscholar.org/api-docs/recommendations?utm_source=chatgpt.com)
+
+    无 key：更可能 429/失败，所以这里做：
+      - 小 limit
+      - 重试 + 指数退避
+      - 失败直接返回空列表（不影响邮件）
+    """
+    if not cfg.get("use_s2_recommendations", True):
+        return []
+
+    pos = load_seed_dois("seeds_positive.txt")
+    neg = load_seed_dois("seeds_negative.txt")
+
+    positive = [doi_to_s2_pid(d) for d in pos if doi_to_s2_pid(d)]
+    negative = [doi_to_s2_pid(d) for d in neg if doi_to_s2_pid(d)]
+
+    if not positive:
+        return []
+
+    url = "https://api.semanticscholar.org/recommendations/v1/papers"
+    params = {
+        "fields": "title,abstract,year,citationCount,venue,externalIds,url",
+        "limit": int(cfg.get("s2_limit", 20)),
+    }
+
+    payload = {"positivePaperIds": positive, "negativePaperIds": negative}
+
+    retries = int(cfg.get("s2_retries", 2))
+    base_backoff = int(cfg.get("s2_backoff_sec", 3))
+
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(
+                url,
+                headers=s2_headers(),
+                params=params,
+                data=json.dumps(payload),
+                timeout=60,
+            )
+
+            # 429/5xx：重试（无 key 时更常见） [oai_citation:6‡Semantic Scholar](https://www.semanticscholar.org/product/api%2Ftutorial?utm_source=chatgpt.com)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                if attempt < retries:
+                    sleep_s = base_backoff * (2 ** attempt)
+                    print(f"S2 rate-limited or server error ({r.status_code}); retry in {sleep_s}s")
+                    time.sleep(sleep_s)
+                    continue
+                print(f"S2 failed with status={r.status_code}; skipping.")
+                return []
+
+            r.raise_for_status()
+            data = r.json()
+            return data.get("recommendedPapers", []) or []
+
+        except Exception as e:
+            if attempt < retries:
+                sleep_s = base_backoff * (2 ** attempt)
+                print(f"S2 exception: {e}; retry in {sleep_s}s")
+                time.sleep(sleep_s)
+                continue
+            print(f"S2 exception: {e}; skipping.")
+            return []
+
+    return []
+
+
+
+
+
+
 # -------------------------
 # enrich / 去重 / 排序
 # -------------------------
@@ -328,6 +428,37 @@ def pick_top(items: list[dict], n: int) -> list[dict]:
     return items[:n]
 
 
+def enrich_s2(cfg, papers: list[dict], tag: str = "reco_s2") -> list[dict]:
+    out = []
+    for p in papers:
+        title = p.get("title") or ""
+        abstract = p.get("abstract") or ""
+
+        if excluded(title, abstract, cfg.get("exclude_keywords", [])):
+            continue
+
+        ext = p.get("externalIds") or {}
+        doi = ext.get("DOI") or ""
+        doi_url = f"https://doi.org/{doi}" if doi else ""
+
+        url = p.get("url") or doi_url
+
+        out.append({
+            "title": title,
+            "abstract": abstract,
+            "publication_year": p.get("year"),
+            "publication_date": None,
+            "cited_by_count": p.get("citationCount", 0) or 0,
+            "venue": p.get("venue") or "",
+            "doi": doi_url,
+            "url": url or doi_url,
+            "relevance": relevance_score(title, abstract, cfg["keywords"]),
+            "bucket": tag,  # reco_s2
+        })
+    return out
+
+
+
 # -------------------------
 # 邮件 HTML
 # -------------------------
@@ -336,13 +467,24 @@ def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -
 
     def card(it: dict) -> str:
         brief = human_brief_cn(it["title"], it["abstract"]).replace("\n", "<br>")
+        source_label = "关键词"
+        if it.get("bucket") == "reco_s2":
+            source_label = "S2猜你喜欢"
+        elif it.get("bucket") == "reco_oa":
+            source_label = "OpenAlex相关"
+        elif it.get("bucket") == "reco":
+            source_label = "推荐"
+        elif it.get("bucket") == "latest":
+            source_label = "最新"
+        elif it.get("bucket") == "classic":
+            source_label = "经典"
         return f"""
         <div style="margin:14px 0;padding:12px;border:1px solid #ddd;border-radius:10px;">
           <div style="font-size:16px;font-weight:700;">
             <a href="{it['url']}" target="_blank" rel="noreferrer">{it['title']}</a>
           </div>
           <div style="color:#555;margin-top:6px;">
-            {it['venue'] or 'Unknown venue'} · {it['publication_year'] or ''} · 引用 {it['cited_by_count']} · relevance {it['relevance']}
+            {it['venue'] or 'Unknown venue'} · {it['publication_year'] or ''} · 引用 {it['cited_by_count']} · relevance {it['relevance']} · 来源 {source_label}
           </div>
           <div style="margin-top:10px;line-height:1.55;">{brief}</div>
         </div>
@@ -407,8 +549,23 @@ def main():
     classic = pick_top(dedupe(enrich(cfg, classic_raw, "classic")), int(cfg["top_classic"]))
 
     # 2) Milestone B：DOI seeds -> related_works 推荐
-    reco_raw = fetch_recommendations_from_seeds(cfg, mailto)
-    reco = pick_top(dedupe(enrich(cfg, reco_raw, "reco")), int(cfg.get("top_reco", 3)))
+    # OpenAlex 推荐（你已完成）
+    reco_oa_raw = fetch_recommendations_from_seeds(cfg, mailto)
+    reco_oa = enrich(cfg, reco_oa_raw, "reco_oa")
+    
+    # S2 推荐（无 key 也尝试；失败会自动跳过）
+    reco_s2_raw = fetch_s2_recommendations_from_seeds(cfg)
+    reco_s2 = enrich_s2(cfg, reco_s2_raw, "reco_s2")
+    
+    # 合并去重
+    reco_all = dedupe(reco_oa + reco_s2)
+    
+    # 轻微偏向 S2（因为更像“猜你喜欢”）；无 S2 数据也不影响
+    for it in reco_all:
+        if it.get("bucket") == "reco_s2":
+            it["relevance"] += 2
+    
+    reco = pick_top(reco_all, int(cfg.get("top_reco", 3)))
 
     html = build_html(cfg, latest, classic, reco)
     subject = f"[每日科研简报] {cfg['topic_cn']} | {now_local(cfg['timezone']).strftime('%Y-%m-%d')}"
