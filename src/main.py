@@ -1,5 +1,7 @@
 import os
 import re
+import time
+import math
 import smtplib
 import datetime as dt
 from zoneinfo import ZoneInfo
@@ -28,8 +30,7 @@ def should_send_now(cfg) -> bool:
 
 
 # -------------------------
-# OpenAlex：抽象还原
-# OpenAlex 常用 abstract_inverted_index 结构，需要还原成正常字符串
+# OpenAlex：抽象还原（abstract_inverted_index -> string）
 # -------------------------
 def reconstruct_abstract(inv_idx):
     if not inv_idx:
@@ -47,6 +48,64 @@ def openalex_get(params):
     return r.json()
 
 
+def openalex_get_work_by_id(openalex_id: str, mailto: str = "") -> dict | None:
+    """
+    openalex_id 通常长这样：
+      https://openalex.org/Wxxxxxxxxx
+    我们把它转换为 API：
+      https://api.openalex.org/works/Wxxxxxxxxx
+    """
+    if not openalex_id:
+        return None
+    oid = openalex_id.strip()
+    if oid.startswith("https://openalex.org/"):
+        work_id = oid.split("/")[-1]  # Wxxxx
+    else:
+        work_id = oid  # 也可能直接给 Wxxxx
+
+    url = f"https://api.openalex.org/works/{work_id}"
+    params = {}
+    if mailto:
+        params["mailto"] = mailto
+    r = requests.get(url, params=params, timeout=60)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def normalize_doi(doi: str) -> str:
+    """
+    OpenAlex 的 doi 字段一般是完整 URL 形式：https://doi.org/...
+    这里把用户输入的 DOI 规范成这种形式，便于 filter=doi:...
+    """
+    d = (doi or "").strip()
+    if not d:
+        return ""
+    d = d.lower()
+    d = d.replace("doi:", "").strip()
+    if d.startswith("http://"):
+        d = "https://" + d[len("http://"):]
+    if d.startswith("https://doi.org/"):
+        return d
+    return "https://doi.org/" + d
+
+
+def openalex_find_work_by_doi(doi: str, mailto: str = "") -> dict | None:
+    """
+    用 filter=doi:... 找到对应 work
+    """
+    doi_url = normalize_doi(doi)
+    if not doi_url:
+        return None
+    params = {"filter": f"doi:{doi_url}", "per_page": 1}
+    if mailto:
+        params["mailto"] = mailto
+    data = openalex_get(params)
+    results = data.get("results", [])
+    return results[0] if results else None
+
+
 def pick_best_url(work: dict) -> str:
     doi = work.get("doi")
     if doi:
@@ -61,6 +120,9 @@ def normalize(s: str) -> str:
     return (s or "").lower()
 
 
+# -------------------------
+# 相关性与规则摘要
+# -------------------------
 def relevance_score(title: str, abstract: str, keywords: list[str]) -> int:
     t = normalize(title)
     a = normalize(abstract)
@@ -112,13 +174,12 @@ def human_brief_cn(title: str, abstract: str) -> str:
     tags = guess_tags(title + " " + abstract)
     nums = extract_numbers(abstract)
 
-    # 截两句“讲人话”的内容（如果摘要很短就提示）
     sents = re.split(r"(?<=[.!?])\s+", abstract.strip())
     sents = [s for s in sents if len(s) > 40]
     explain = " ".join(sents[:2]) if sents else "（摘要信息不足：建议点开链接快速判断是否与你的在线监测链路相关。）"
 
     return "\n".join([
-        f"一句话：这篇工作围绕结温在线估算/监测给出一条可实现的技术路径。",
+        "一句话：这篇工作围绕结温在线估算/监测给出一条可实现的技术路径。",
         f"方法线索：{(' / '.join(tags)) if tags else '未从摘要里识别到明确方法关键词'}",
         f"可量化指标：{nums if nums else '摘要未给出明确数值（或需读全文/图表）'}",
         f"拆解：{explain}",
@@ -126,9 +187,10 @@ def human_brief_cn(title: str, abstract: str) -> str:
     ])
 
 
+# -------------------------
+# 候选获取：关键词（最新/经典）
+# -------------------------
 def fetch_latest_and_classic(cfg, mailto: str):
-    # OpenAlex 推荐用 search 参数搜 works（title/abstract/fulltext 子集）
-    # https://docs.openalex.org/api-entities/works/search-works  [oai_citation:7‡OpenAlex](https://docs.openalex.org/api-entities/works/search-works?utm_source=chatgpt.com)
     query = cfg.get("search_query") or " ".join(cfg["keywords"][:6])
 
     today = dt.date.today()
@@ -139,7 +201,7 @@ def fetch_latest_and_classic(cfg, mailto: str):
 
     base = {"search": query, "per_page": 50}
     if mailto:
-        base["mailto"] = mailto  # polite pool（更高限额/更稳定） [oai_citation:8‡OpenAlex](https://docs.openalex.org/api-guide-for-llms?utm_source=chatgpt.com)
+        base["mailto"] = mailto
 
     latest = openalex_get({
         **base,
@@ -156,13 +218,83 @@ def fetch_latest_and_classic(cfg, mailto: str):
     return latest, classic
 
 
-def enrich(cfg, works: list[dict]) -> list[dict]:
+# -------------------------
+# Milestone B：DOI seeds -> related_works 推荐
+# -------------------------
+def load_seed_dois(path: str) -> list[str]:
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            out.append(s)
+    return out
+
+
+def fetch_recommendations_from_seeds(cfg, mailto: str) -> list[dict]:
+    """
+    对每个 seed DOI：
+      DOI -> OpenAlex work
+      work.related_works -> 拉回相关 works
+    最后合并去重，并打上 reco_source 标记
+    """
+    pos = load_seed_dois("seeds_positive.txt")
+    neg = set(normalize_doi(x) for x in load_seed_dois("seeds_negative.txt"))
+
+    if not pos:
+        return []
+
+    max_related = int(cfg.get("max_related_per_seed", 25))
+    all_ids: list[str] = []
+    seed_doi_urls = set()
+
+    # 1) 每个 DOI 找到对应 work，并收集 related_works ids
+    for doi in pos:
+        w = openalex_find_work_by_doi(doi, mailto)
+        time.sleep(0.12)  # 轻微限速，减少被限流风险
+        if not w:
+            continue
+        doi_url = w.get("doi")
+        if doi_url:
+            seed_doi_urls.add(doi_url)
+
+        rel = w.get("related_works") or []
+        all_ids.extend(rel[:max_related])
+
+    # 2) 拉回 related works 详情（逐个拉，量不大更稳）
+    recos = []
+    seen = set()
+    for oid in all_ids:
+        if oid in seen:
+            continue
+        seen.add(oid)
+        w = openalex_get_work_by_id(oid, mailto)
+        time.sleep(0.12)
+        if not w:
+            continue
+        # 排除：负例 DOI、以及种子本身
+        doi_url = w.get("doi") or ""
+        if doi_url and (doi_url in neg or doi_url in seed_doi_urls):
+            continue
+        recos.append(w)
+
+    return recos
+
+
+# -------------------------
+# enrich / 去重 / 排序
+# -------------------------
+def enrich(cfg, works: list[dict], tag: str = "") -> list[dict]:
     out = []
     for w in works:
         title = w.get("title") or ""
         abstract = reconstruct_abstract(w.get("abstract_inverted_index"))
         if excluded(title, abstract, cfg.get("exclude_keywords", [])):
             continue
+
         out.append({
             "title": title,
             "abstract": abstract,
@@ -173,6 +305,7 @@ def enrich(cfg, works: list[dict]) -> list[dict]:
             "doi": w.get("doi"),
             "url": pick_best_url(w),
             "relevance": relevance_score(title, abstract, cfg["keywords"]),
+            "bucket": tag,  # latest / classic / reco
         })
     return out
 
@@ -190,11 +323,15 @@ def dedupe(items: list[dict]) -> list[dict]:
 
 
 def pick_top(items: list[dict], n: int) -> list[dict]:
+    # 简单可用：相关性优先，再看引用数
     items = sorted(items, key=lambda x: (x["relevance"], x["cited_by_count"]), reverse=True)
     return items[:n]
 
 
-def build_html(cfg, latest: list[dict], classic: list[dict]) -> str:
+# -------------------------
+# 邮件 HTML
+# -------------------------
+def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -> str:
     date_str = now_local(cfg["timezone"]).strftime("%Y-%m-%d (%a)")
 
     def card(it: dict) -> str:
@@ -211,12 +348,16 @@ def build_html(cfg, latest: list[dict], classic: list[dict]) -> str:
         </div>
         """
 
+    reco_days = ""
     return f"""
     <html><body style="font-family:Arial, Helvetica, sans-serif;">
       <h2>{cfg['topic_cn']} — 每日科研简报（{date_str}）</h2>
       <p style="color:#666;">
-        数据源：OpenAlex（works 搜索 + 引用数）。OpenAlex 有速率限制，建议带 mailto 做 polite usage。
+        数据源：OpenAlex（works 搜索 + 引用数 + related_works 推荐）。建议带 OPENALEX_MAILTO 做 polite usage。
       </p>
+
+      <h3>⭐ 为你推荐（基于你收藏的 DOI 种子论文）</h3>
+      {''.join(card(x) for x in reco) if reco else '<p>今天“为你推荐”为空：请在 seeds_positive.txt 添加 3–10 篇你认可的 DOI。</p>'}
 
       <h3>🆕 最新进展（近 {cfg['latest_days']} 天）</h3>
       {''.join(card(x) for x in latest) if latest else '<p>今天未抓到足够匹配的最新条目。</p>'}
@@ -226,7 +367,7 @@ def build_html(cfg, latest: list[dict], classic: list[dict]) -> str:
 
       <hr>
       <p style="color:#888;font-size:12px;">
-        下一阶段：加入 DOI 种子论文 + OpenAlex related_works + Semantic Scholar Recommendations（更懂你），并预留大模型摘要接口。
+        下一阶段：接入 Semantic Scholar Recommendations（支持正/负例更懂你），并把摘要升级为“可选大模型生成（只对 Top-N 调用，控制 token 成本）”。
       </p>
     </body></html>
     """
@@ -259,12 +400,17 @@ def main():
         return
 
     mailto = os.getenv("OPENALEX_MAILTO", "")
+
+    # 1) 关键词：最新 + 经典
     latest_raw, classic_raw = fetch_latest_and_classic(cfg, mailto)
+    latest = pick_top(dedupe(enrich(cfg, latest_raw, "latest")), int(cfg["top_latest"]))
+    classic = pick_top(dedupe(enrich(cfg, classic_raw, "classic")), int(cfg["top_classic"]))
 
-    latest = pick_top(dedupe(enrich(cfg, latest_raw)), int(cfg["top_latest"]))
-    classic = pick_top(dedupe(enrich(cfg, classic_raw)), int(cfg["top_classic"]))
+    # 2) Milestone B：DOI seeds -> related_works 推荐
+    reco_raw = fetch_recommendations_from_seeds(cfg, mailto)
+    reco = pick_top(dedupe(enrich(cfg, reco_raw, "reco")), int(cfg.get("top_reco", 3)))
 
-    html = build_html(cfg, latest, classic)
+    html = build_html(cfg, latest, classic, reco)
     subject = f"[每日科研简报] {cfg['topic_cn']} | {now_local(cfg['timezone']).strftime('%Y-%m-%d')}"
 
     send_email(subject, html)
