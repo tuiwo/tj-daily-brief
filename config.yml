@@ -9,7 +9,7 @@ latest_days: 30
 top_latest: 3
 top_classic: 2
 top_reco: 3
-
+max_related_per_seed: 25
 
 keywords:
   - "junction temperature"
