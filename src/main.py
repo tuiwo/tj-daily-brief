@@ -464,6 +464,8 @@ def enrich_s2(cfg, papers: list[dict], tag: str = "reco_s2") -> list[dict]:
 # -------------------------
 def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -> str:
     date_str = now_local(cfg["timezone"]).strftime("%Y-%m-%d (%a)")
+    build_sha = (os.getenv("GITHUB_SHA", "") or "")[:7]
+    run_id = os.getenv("GITHUB_RUN_ID", "")
 
     def card(it: dict) -> str:
         brief = human_brief_cn(it["title"], it["abstract"]).replace("\n", "<br>")
@@ -495,7 +497,8 @@ def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -
     <html><body style="font-family:Arial, Helvetica, sans-serif;">
       <h2>{cfg['topic_cn']} — 每日科研简报（{date_str}）</h2>
       <p style="color:#666;">
-        数据源：OpenAlex（works 搜索 + 引用数 + related_works 推荐）。建议带 OPENALEX_MAILTO 做 polite usage。
+        数据源：OpenAlex（works 搜索 + 引用数 + related_works 推荐）。建议带 OPENALEX_MAILTO 做 polite usage。<br>
+        构建标识：sha={build_sha} run={run_id}
       </p>
 
       <h3>⭐ 为你推荐（基于你收藏的 DOI 种子论文）</h3>
