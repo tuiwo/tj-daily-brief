@@ -129,7 +129,7 @@ def human_brief_cn(title: str, abstract: str) -> str:
 def fetch_latest_and_classic(cfg, mailto: str):
     # OpenAlex 推荐用 search 参数搜 works（title/abstract/fulltext 子集）
     # https://docs.openalex.org/api-entities/works/search-works  [oai_citation:7‡OpenAlex](https://docs.openalex.org/api-entities/works/search-works?utm_source=chatgpt.com)
-    query = " ".join(cfg["keywords"])
+    query = cfg.get("search_query") or " ".join(cfg["keywords"][:6])
 
     today = dt.date.today()
     from_date = (today - dt.timedelta(days=int(cfg["latest_days"]))).isoformat()
