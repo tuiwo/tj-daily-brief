@@ -1,3 +1,9 @@
+use_s2_recommendations: true
+s2_limit: 20          # 没 key 时建议 10~30，先保守
+s2_retries: 2         # 失败重试次数
+s2_backoff_sec: 3     # 重试退避秒数（指数退避的基数）
+
+
 topic_cn: 功率半导体结温在线监测
 timezone: America/Los_Angeles
 send_hour_local: 4
