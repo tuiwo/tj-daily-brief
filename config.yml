@@ -7,6 +7,9 @@ top_latest: 3
 top_classic: 2
 top_reco: 3
 
+search_query: "junction temperature estimation online monitoring IGBT SiC power module"
+latest_days: 30
+
 keywords:
   - "junction temperature"
   - "Tj"
