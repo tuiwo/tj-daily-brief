@@ -6,7 +6,7 @@ s2_backoff_sec: 3     # 重试退避秒数（指数退避的基数）
 
 topic_cn: 功率半导体结温在线监测
 timezone: America/Los_Angeles
-send_hour_local: 4
+send_hour_local: 6
 
 
 search_query: "junction temperature estimation online monitoring IGBT SiC power module"
