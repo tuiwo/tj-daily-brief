@@ -30,3 +30,4 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
           OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
+          S2_API_KEY: ${{ secrets.S2_API_KEY }}
