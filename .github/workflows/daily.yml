@@ -31,3 +31,4 @@ jobs:
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
           OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
           S2_API_KEY: ${{ secrets.S2_API_KEY }}
+          AI4SCHOLAR_API_KEY: ${{ secrets.AI4SCHOLAR_API_KEY }}
