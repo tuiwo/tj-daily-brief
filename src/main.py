@@ -322,7 +322,9 @@ def fetch_s2_recommendations_from_seeds(cfg) -> list[dict]:
       - 失败直接返回空列表（不影响邮件）
     """
     if not cfg.get("use_s2_recommendations", True):
-        # 先尝试 ai4scholar：如果 HTTP 200，就直接用它的结果并跳过官方 S2
+        return []
+
+    # 先尝试 ai4scholar：成功就直接用它，跳过官方 S2
     ok, recs = fetch_ai4s_recommendations_from_seeds(cfg)
     if ok:
         print(f"AI4S: used, recs={len(recs)} (skip official S2)")
@@ -330,9 +332,7 @@ def fetch_s2_recommendations_from_seeds(cfg) -> list[dict]:
 
 
 
-
-        return []
-
+    
     
     pos = load_seed_dois("seeds_positive.txt")
     neg = load_seed_dois("seeds_negative.txt")
