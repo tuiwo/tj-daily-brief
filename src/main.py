@@ -322,8 +322,18 @@ def fetch_s2_recommendations_from_seeds(cfg) -> list[dict]:
       - 失败直接返回空列表（不影响邮件）
     """
     if not cfg.get("use_s2_recommendations", True):
+        # 先尝试 ai4scholar：如果 HTTP 200，就直接用它的结果并跳过官方 S2
+    ok, recs = fetch_ai4s_recommendations_from_seeds(cfg)
+    if ok:
+        print(f"AI4S: used, recs={len(recs)} (skip official S2)")
+        return recs
+
+
+
+
         return []
 
+    
     pos = load_seed_dois("seeds_positive.txt")
     neg = load_seed_dois("seeds_negative.txt")
 
@@ -384,6 +394,98 @@ def fetch_s2_recommendations_from_seeds(cfg) -> list[dict]:
     return []
 
 
+# -------------------------
+# ai4scholar API
+# -------------------------
+def ai4s_headers():
+    key = (os.getenv("AI4SCHOLAR_API_KEY") or "").strip()
+    if not key:
+        return None
+    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+
+
+def fetch_ai4s_recommendations_from_seeds(cfg) -> tuple[bool, list[dict]]:
+    """
+    ai4scholar 优先入口：
+    - 成功（HTTP 200）=> 返回 (True, recs)，并“跳过”官方 S2
+    - 失败/异常 => 返回 (False, [])，让外层 fallback 到官方 S2
+
+    说明：
+    ai4scholar 文档示例显示用 Authorization: Bearer 方式访问 /graph/v1/...  [oai_citation:2‡Awesomely](https://ai4scholar.net/docs/code-examples)
+    我们这里按 Semantic Scholar Recommendations 的路径去尝试：/recommendations/v1/papers(/)
+    """
+    headers = ai4s_headers()
+    if not headers:
+        return (False, [])
+
+    pos = load_seed_dois("seeds_positive.txt")
+    neg = load_seed_dois("seeds_negative.txt")
+    positive = [doi_to_s2_pid(d) for d in pos if doi_to_s2_pid(d)]
+    negative = [doi_to_s2_pid(d) for d in neg if doi_to_s2_pid(d)]
+    if not positive:
+        return (True, [])  # 有 key 但没有正例：视为“成功但无输出”，跳过官方 S2
+
+    base = "https://ai4scholar.net"
+    url = f"{base}/recommendations/v1/papers/"  # 尾斜杠更稳
+    params = {
+        "fields": "title,abstract,year,citationCount,venue,externalIds,url",
+        "limit": int(cfg.get("s2_limit", 20)),
+    }
+    payload = {"positivePaperIds": positive, "negativePaperIds": negative}
+
+    retries = int(cfg.get("s2_retries", 2))
+    base_backoff = int(cfg.get("s2_backoff_sec", 3))
+
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(url, headers=headers, params=params, data=json.dumps(payload), timeout=60)
+
+            # 打印积分信息（ai4scholar 示例里提到这些 headers） [oai_citation:3‡Awesomely](https://ai4scholar.net/docs/code-examples)
+            if r.status_code == 200:
+                rem = r.headers.get("X-Credits-Remaining")
+                charged = r.headers.get("X-Credits-Charged")
+                print(f"AI4S: ok, remaining={rem}, charged={charged}")
+
+                data = r.json()
+                # 兼容两种可能的返回结构：recommendedPapers（S2风格） 或 data（ai4s风格）
+                recs = data.get("recommendedPapers", None)
+                if recs is None:
+                    recs = data.get("data", []) or []
+
+                # 标记来源，便于你在邮件里显示“via ai4scholar”
+                for p in recs:
+                    if isinstance(p, dict):
+                        p["_via"] = "ai4scholar"
+
+                return (True, recs)
+
+            # 429/5xx：重试
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                if attempt < retries:
+                    sleep_s = base_backoff * (2 ** attempt)
+                    print(f"AI4S: {r.status_code}; retry in {sleep_s}s")
+                    time.sleep(sleep_s)
+                    continue
+                print(f"AI4S: failed status={r.status_code}; fallback to official S2.")
+                return (False, [])
+
+            # 401/402/403 等：直接 fallback（401/402 在 ai4scholar 文档示例里有提到） [oai_citation:4‡Awesomely](https://ai4scholar.net/docs/code-examples)
+            print(f"AI4S: failed status={r.status_code}; fallback to official S2.")
+            return (False, [])
+
+        except Exception as e:
+            if attempt < retries:
+                sleep_s = base_backoff * (2 ** attempt)
+                print(f"AI4S: exception {e}; retry in {sleep_s}s")
+                time.sleep(sleep_s)
+                continue
+            print(f"AI4S: exception {e}; fallback to official S2.")
+            return (False, [])
+
+    return (False, [])
+
+
+
 
 
 
@@ -410,6 +512,7 @@ def enrich(cfg, works: list[dict], tag: str = "") -> list[dict]:
             "url": pick_best_url(w),
             "relevance": relevance_score(title, abstract, cfg["keywords"]),
             "bucket": tag,  # latest / classic / reco
+            "via": p.get("_via", "official_s2"),
         })
     return out
 
@@ -475,7 +578,8 @@ def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -
         brief = human_brief_cn(it["title"], it["abstract"]).replace("\n", "<br>")
         source_label = "关键词"
         if it.get("bucket") == "reco_s2":
-            source_label = "S2猜你喜欢"
+            via = it.get("via","official_s2")
+            source_label = "S2猜你喜欢(ai4scholar)" if via == "ai4scholar" else "S2猜你喜欢(官方)"
         elif it.get("bucket") == "reco_oa":
             source_label = "OpenAlex相关"
         elif it.get("bucket") == "reco":
@@ -496,6 +600,8 @@ def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -
         </div>
         """
 
+
+    
     reco_days = ""
     return f"""
     <html><body style="font-family:Arial, Helvetica, sans-serif;">
