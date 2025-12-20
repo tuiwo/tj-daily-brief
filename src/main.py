@@ -529,6 +529,50 @@ def dedupe(items: list[dict]) -> list[dict]:
     return out
 
 
+def load_seen(path="seen.json") -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_seen(seen: dict, path="seen.json"):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(seen, f, ensure_ascii=False, indent=2)
+
+
+def filter_seen(cfg, items: list[dict], seen: dict) -> list[dict]:
+    keep_days = int(cfg.get("seen_days_keep", 30))
+    today = dt.date.today()
+
+    # 清理过期记录
+    cleaned = {}
+    for k, v in seen.items():
+        try:
+            d = dt.date.fromisoformat(v)
+            if (today - d).days <= keep_days:
+                cleaned[k] = v
+        except Exception:
+            pass
+    seen.clear()
+    seen.update(cleaned)
+
+    out = []
+    for it in items:
+        key = it.get("doi") or it.get("url") or it.get("title")
+        if not key:
+            continue
+        if key in seen:
+            continue
+        out.append(it)
+    return out
+
+
+
+
 def pick_top(items: list[dict], n: int) -> list[dict]:
     # 简单可用：相关性优先，再看引用数
     items = sorted(items, key=lambda x: (x["relevance"], x["cited_by_count"]), reverse=True)
@@ -588,6 +632,8 @@ def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -
             source_label = "最新"
         elif it.get("bucket") == "classic":
             source_label = "经典"
+        reco_s2 = [x for x in reco if x.get("bucket") == "reco_s2"]
+        reco_oa = [x for x in reco if x.get("bucket") == "reco_oa"]
         return f"""
         <div style="margin:14px 0;padding:12px;border:1px solid #ddd;border-radius:10px;">
           <div style="font-size:16px;font-weight:700;">
@@ -611,8 +657,11 @@ def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -
         构建标识：sha={build_sha} run={run_id}
       </p>
 
-      <h3>⭐ 为你推荐（基于你收藏的 DOI 种子论文）</h3>
-      {''.join(card(x) for x in reco) if reco else '<p>今天“为你推荐”为空：请在 seeds_positive.txt 添加 3–10 篇你认可的 DOI。</p>'}
+      <h3>⭐ S2猜你喜欢（更像“你可能也喜欢”）</h3>
+      {''.join(card(x) for x in reco_s2) if reco_s2 else '<p>S2 今天没有产出（或被跳过），不影响其他内容。</p>'}
+
+      <h3>🧭 OpenAlex脉络（沿你的种子论文相关图谱扩展）</h3>
+      {''.join(card(x) for x in reco_oa) if reco_oa else '<p>OpenAlex related_works 今天为空：检查 seeds_positive.txt DOI 是否有效。</p>'}
 
       <h3>🆕 最新进展（近 {cfg['latest_days']} 天）</h3>
       {''.join(card(x) for x in latest) if latest else '<p>今天未抓到足够匹配的最新条目。</p>'}
@@ -655,11 +704,15 @@ def main():
         return
 
     mailto = os.getenv("OPENALEX_MAILTO", "")
+    seen = load_seen()
 
     # 1) 关键词：最新 + 经典
+    # 1) 关键词：最新 + 经典
     latest_raw, classic_raw = fetch_latest_and_classic(cfg, mailto)
-    latest = pick_top(dedupe(enrich(cfg, latest_raw, "latest")), int(cfg["top_latest"]))
-    classic = pick_top(dedupe(enrich(cfg, classic_raw, "classic")), int(cfg["top_classic"]))
+    latest_items = filter_seen(cfg, dedupe(enrich(cfg, latest_raw, "latest")), seen)
+    classic_items = filter_seen(cfg, dedupe(enrich(cfg, classic_raw, "classic")), seen)
+    latest = pick_top(latest_items, int(cfg["top_latest"]))
+    classic = pick_top(classic_items, int(cfg["top_classic"]))
 
     # 2) Milestone B：DOI seeds -> related_works 推荐
     # OpenAlex 推荐（你已完成）
@@ -684,6 +737,13 @@ def main():
     subject = f"[每日科研简报] {cfg['topic_cn']} | {now_local(cfg['timezone']).strftime('%Y-%m-%d')}"
 
     send_email(subject, html)
+    today_str = dt.date.today().isoformat()
+    for lst in [latest, classic, reco]:
+        for it in lst:
+            k = it.get("doi") or it.get("url") or it.get("title")
+            if k:
+                seen[k] = today_str
+    save_seen(seen)
     print("Email sent.")
 
 
