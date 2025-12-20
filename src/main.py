@@ -512,7 +512,7 @@ def enrich(cfg, works: list[dict], tag: str = "") -> list[dict]:
             "url": pick_best_url(w),
             "relevance": relevance_score(title, abstract, cfg["keywords"]),
             "bucket": tag,  # latest / classic / reco
-            "via": p.get("_via", "official_s2"),
+            "via": w.get("_via", "official_s2"),
         })
     return out
 
