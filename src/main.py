@@ -394,6 +394,87 @@ def fetch_s2_recommendations_from_seeds(cfg) -> list[dict]:
     return []
 
 
+
+
+
+def bare_doi(doi_or_url: str) -> str:
+    """
+    输入可能是：
+      - https://doi.org/10.xxx/yyy  （OpenAlex 常见）
+      - DOI:10.xxx/yyy
+      - 10.xxx/yyy
+    输出统一为：10.xxx/yyy
+    """
+    s = (doi_or_url or "").strip()
+    if not s:
+        return ""
+    s = s.lower().replace("doi:", "").strip()
+    s = s.replace("https://doi.org/", "").replace("http://doi.org/", "")
+    return s.strip()
+
+
+def unpaywall_lookup(doi_or_url: str, email: str, timeout: int = 20) -> dict | None:
+    """
+    Unpaywall v2: https://api.unpaywall.org/v2/{DOI}?email=...   [oai_citation:4‡pubfetcher.readthedocs.io](https://pubfetcher.readthedocs.io/en/stable/fetcher.html?utm_source=chatgpt.com)
+    """
+    doi = bare_doi(doi_or_url)
+    if not doi or not email:
+        return None
+
+    url = f"https://api.unpaywall.org/v2/{doi}"
+    r = requests.get(url, params={"email": email}, timeout=timeout)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+def attach_fulltext_links(cfg, items: list[dict]) -> list[dict]:
+    """
+    给每条记录补：
+      - pdf_url（若有）
+      - oa_status / license / version（可选显示）
+    只对“已经入选要发邮件的条目”做查询，控制调用量（建议≤10万/天/用户）。 [oai_citation:5‡docs.ropensci.org](https://docs.ropensci.org/roadoi/reference/oadoi_fetch.html)
+    """
+    email = (os.getenv("UNPAYWALL_EMAIL") or "").strip()
+    if not email:
+        print("Unpaywall: UNPAYWALL_EMAIL missing; skip fulltext enrichment.")
+        return items
+
+    cache: dict[str, dict] = {}
+    for it in items:
+        d = bare_doi(it.get("doi") or "")
+        if not d:
+            continue
+
+        if d in cache:
+            data = cache[d]
+        else:
+            try:
+                data = unpaywall_lookup(d, email, timeout=int(cfg.get("unpaywall_timeout", 20)))
+            except Exception as e:
+                print(f"Unpaywall error for DOI {d}: {e}")
+                data = None
+            cache[d] = data or {}
+            time.sleep(0.12)  # 轻微限速，礼貌一点
+
+        if not data:
+            continue
+
+        best = data.get("best_oa_location") or {}
+        pdf = best.get("url_for_pdf") or ""   # 字段名在 Unpaywall schema/支持文档里列出  [oai_citation:6‡Unpaywall](https://support.unpaywall.org/support/solutions/articles/44002142311-what-do-the-fields-in-the-api-response-and-snapshot-records-mean-)
+        landing = best.get("url_for_landing_page") or ""
+        it["pdf_url"] = pdf or ""
+        it["oa_status"] = data.get("oa_status") or ""
+        it["oa_license"] = best.get("license") or ""
+        it["oa_version"] = best.get("version") or ""
+        it["oa_landing"] = landing or ""
+
+    return items
+
+
+
+
 # -------------------------
 # ai4scholar API
 # -------------------------
@@ -617,12 +698,14 @@ def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -
     date_str = now_local(cfg["timezone"]).strftime("%Y-%m-%d (%a)")
     build_sha = (os.getenv("GITHUB_SHA", "") or "")[:7]
     run_id = os.getenv("GITHUB_RUN_ID", "")
-
+    
     def card(it: dict) -> str:
         brief = human_brief_cn(it["title"], it["abstract"]).replace("\n", "<br>")
+
+        # 来源标签
         source_label = "关键词"
         if it.get("bucket") == "reco_s2":
-            via = it.get("via","official_s2")
+            via = it.get("via", "official_s2")
             source_label = "S2猜你喜欢(ai4scholar)" if via == "ai4scholar" else "S2猜你喜欢(官方)"
         elif it.get("bucket") == "reco_oa":
             source_label = "OpenAlex相关"
@@ -632,22 +715,34 @@ def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -
             source_label = "最新"
         elif it.get("bucket") == "classic":
             source_label = "经典"
-        reco_s2 = [x for x in reco if x.get("bucket") == "reco_s2"]
-        reco_oa = [x for x in reco if x.get("bucket") == "reco_oa"]
+
+        # 标题永远指向 DOI/落地页；PDF 作为可选按钮
+        doi_url = it.get("url") or ""
+        pdf_url = it.get("pdf_url") or ""
+
+        pdf_btn = ""
+        if pdf_url:
+            pdf_btn = f"""
+              <a href="{pdf_url}" target="_blank" rel="noreferrer"
+                 style="display:inline-block;margin-left:8px;padding:2px 10px;border:1px solid #888;border-radius:999px;text-decoration:none;font-weight:600;">
+                PDF
+              </a>
+            """
+
         return f"""
         <div style="margin:14px 0;padding:12px;border:1px solid #ddd;border-radius:10px;">
           <div style="font-size:16px;font-weight:700;">
-            <a href="{it['url']}" target="_blank" rel="noreferrer">{it['title']}</a>
+            <a href="{doi_url}" target="_blank" rel="noreferrer">{it['title']}</a>
+            {pdf_btn}
           </div>
           <div style="color:#555;margin-top:6px;">
-            {it['venue'] or 'Unknown venue'} · {it['publication_year'] or ''} · 引用 {it['cited_by_count']} · relevance {it['relevance']} · 来源 {source_label}
+            {it['venue'] or 'Unknown venue'} · {it['publication_year'] or ''} · 引用 {it['cited_by_count']} · relevance {it['relevance']} · 来源 {source_label} · 全文 {"PDF" if pdf_url else "无"}
           </div>
           <div style="margin-top:10px;line-height:1.55;">{brief}</div>
         </div>
         """
 
 
-    
     reco_days = ""
     return f"""
     <html><body style="font-family:Arial, Helvetica, sans-serif;">
@@ -736,6 +831,10 @@ def main():
     html = build_html(cfg, latest, classic, reco)
     subject = f"[每日科研简报] {cfg['topic_cn']} | {now_local(cfg['timezone']).strftime('%Y-%m-%d')}"
 
+    latest = attach_fulltext_links(cfg, latest)
+    classic = attach_fulltext_links(cfg, classic)
+    reco = attach_fulltext_links(cfg, reco)
+    
     send_email(subject, html)
     today_str = dt.date.today().isoformat()
     for lst in [latest, classic, reco]:
