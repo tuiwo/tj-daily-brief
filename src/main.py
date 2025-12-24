@@ -25,10 +25,13 @@ def now_local(tz: str) -> dt.datetime:
     return dt.datetime.now(ZoneInfo(tz))
 
 
+# def should_send_now(cfg) -> bool:
+#     # 只在本地指定小时发信（用于配合 UTC 15/16 双跑）
+#     return now_local(cfg["timezone"]).hour == int(cfg["send_hour_local"])
 def should_send_now(cfg) -> bool:
-    # 只在本地指定小时发信（用于配合 UTC 15/16 双跑）
-    return now_local(cfg["timezone"]).hour == int(cfg["send_hour_local"])
-
+    now = now_local(cfg["timezone"])
+    print(f"DEBUG tz={cfg['timezone']} now={now.isoformat()} hour={now.hour} send_hour_local={cfg['send_hour_local']}")
+    return now.hour == int(cfg["send_hour_local"])
 
 # -------------------------
 # OpenAlex：抽象还原（abstract_inverted_index -> string）
