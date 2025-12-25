@@ -3,9 +3,7 @@ name: Daily Research Brief
 
 on:
   schedule:
-    # GitHub Actions schedule 使用 UTC（官方文档写明 UTC times）
-    # 同时跑 15/16 点 UTC，配合脚本里“本地 8 点才发送”，自动适配夏令时
-    - cron: '7 0 * * *'
+    - cron: '7,22,37,52 0 * * *'   # UTC 00:07/00:22/00:37/00:52 => 北京时间 08 点多次尝试
   workflow_dispatch: {}
 
 jobs:
