@@ -3,7 +3,7 @@ name: Daily Research Brief
 
 on:
   schedule:
-    - cron: '7,22,37,52 0 * * *'   # UTC 00:07/00:22/00:37/00:52 => 北京时间 08 点多次尝试
+    - cron: '7,22 22 * * *'   # UTC 00:07/00:22/00:37/00:52 => 北京时间 08 点多次尝试
   workflow_dispatch: {}
 
 jobs:
