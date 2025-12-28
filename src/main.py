@@ -697,7 +697,13 @@ def enrich_s2(cfg, papers: list[dict], tag: str = "reco_s2") -> list[dict]:
 # -------------------------
 # 邮件 HTML
 # -------------------------
-def build_html(cfg, latest: list[dict], classic: list[dict], reco: list[dict]) -> str:
+def build_html(
+    cfg,
+    latest: list[dict],
+    classic: list[dict],
+    reco_s2: list[dict],
+    reco_oa: list[dict],
+) -> str:
     date_str = now_local(cfg["timezone"]).strftime("%Y-%m-%d (%a)")
     build_sha = (os.getenv("GITHUB_SHA", "") or "")[:7]
     run_id = os.getenv("GITHUB_RUN_ID", "")
@@ -831,7 +837,7 @@ def main():
     
     reco = pick_top(reco_all, int(cfg.get("top_reco", 3)))
 
-    html = build_html(cfg, latest, classic, reco)
+    html = build_html(cfg, latest, classic, reco_s2, reco_oa)
     subject = f"[每日科研简报] {cfg['topic_cn']} | {now_local(cfg['timezone']).strftime('%Y-%m-%d')}"
 
     latest = attach_fulltext_links(cfg, latest)
