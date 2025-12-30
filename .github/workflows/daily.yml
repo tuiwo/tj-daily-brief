@@ -23,6 +23,9 @@ jobs:
           key: seen-${{ github.repository }}-${{ github.run_id }}
           restore-keys: |
             seen-${{ github.repository }}-
+      
+      - name: Debug seen before run
+        run: ls -l seen.json || echo "no seen.json restored"
             
       - name: Install deps
         run: pip install -r requirements.txt
@@ -42,3 +45,6 @@ jobs:
           S2_API_KEY: ${{ secrets.S2_API_KEY }}
           AI4SCHOLAR_API_KEY: ${{ secrets.AI4SCHOLAR_API_KEY }}
           UNPAYWALL_EMAIL: ${{ secrets.UNPAYWALL_EMAIL }}
+
+      - name: Debug seen after run
+        run: ls -l seen.json || echo "no seen.json after run"
