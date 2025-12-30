@@ -621,6 +621,7 @@ def load_seen(path="seen.json") -> dict:
             return json.load(f)
     except Exception:
         return {}
+    
 
 
 def save_seen(seen: dict, path="seen.json"):
@@ -813,6 +814,7 @@ def main():
 
     mailto = os.getenv("OPENALEX_MAILTO", "")
     seen = load_seen()
+    print(f"DEBUG seen loaded: {len(seen)}")
 
     # 1) 关键词：最新 + 经典
     # 1) 关键词：最新 + 经典
@@ -825,12 +827,14 @@ def main():
     # 2) Milestone B：DOI seeds -> related_works 推荐
     # OpenAlex 推荐（你已完成）
     reco_oa_raw = fetch_recommendations_from_seeds(cfg, mailto)
-    reco_oa = enrich(cfg, reco_oa_raw, "reco_oa")
+    reco_oa = dedupe(enrich(cfg, reco_oa_raw, "reco_oa"))
+    reco_oa = filter_seen(cfg,reco_oa,seen)
     reco_oa = pick_top_cited(reco_oa, int(cfg.get("top_reco_oa", 10)))
     
     # S2 推荐（无 key 也尝试；失败会自动跳过）
     reco_s2_raw = fetch_s2_recommendations_from_seeds(cfg)
-    reco_s2 = enrich_s2(cfg, reco_s2_raw, "reco_s2")
+    reco_s2 = dedupe(enrich_s2(cfg, reco_s2_raw, "reco_s2"))
+    reco_s2 = filter_seen(cfg,reco_s2,seen)
     reco_s2 = pick_top_cited(reco_s2, int(cfg.get("top_reco_s2", 10)))
     
     # 合并去重
@@ -843,21 +847,23 @@ def main():
     
     reco = pick_top(reco_all, int(cfg.get("top_reco", 3)))
 
+    latest = attach_fulltext_links(cfg, latest)
+    classic = attach_fulltext_links(cfg, classic)
+    reco_s2 = attach_fulltext_links(cfg, reco_s2)
+    reco_oa = attach_fulltext_links(cfg, reco_oa)
+
     html = build_html(cfg, latest, classic, reco_s2, reco_oa)
     subject = f"[每日科研简报] {cfg['topic_cn']} | {now_local(cfg['timezone']).strftime('%Y-%m-%d')}"
 
-    latest = attach_fulltext_links(cfg, latest)
-    classic = attach_fulltext_links(cfg, classic)
-    reco = attach_fulltext_links(cfg, reco)
-    
     send_email(subject, html)
     today_str = dt.date.today().isoformat()
-    for lst in [latest, classic, reco]:
+    for lst in [latest, classic, reco_s2, reco_oa]:
         for it in lst:
             k = it.get("doi") or it.get("url") or it.get("title")
             if k:
                 seen[k] = today_str
     save_seen(seen)
+    print(f"DEBUG seen saved: {len(seen)}")
     print("Email sent.")
 
 
