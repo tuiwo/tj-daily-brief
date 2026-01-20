@@ -311,26 +311,24 @@ def fetch_works_by_openalex_ids(ids: list[str], mailto: str = "", per_page: int 
         time.sleep(0.12)
     return out
 
-
-def fetch_citation_graph_from_seeds(cfg, mailto: str) -> list[dict]:
+def fetch_graph_buckets_from_seeds(cfg, mailto: str) -> tuple[list[dict], list[dict]]:
     """
-    引用图谱扩展：
-      - references: seed.referenced_works（出引文，偏“根论文/经典”）
-      - citations: 通过 seed.cited_by_api_url（入引文，偏“关键后续”）
+    返回两个桶：
+      - refs_works：seed.referenced_works（出引文，偏“根论文/经典”）
+      - citedby_works：seed.cited_by_api_url（入引文，偏“关键后续”）
 
-    Work 对象字段说明：referenced_works / cited_by_api_url。 [oai_citation:4‡OpenAlex](https://docs.openalex.org/api-entities/works)
+    Work 字段：referenced_works / cited_by_api_url。
     """
     pos = load_seed_dois("seeds_positive.txt")
     neg = set(normalize_doi(x) for x in load_seed_dois("seeds_negative.txt"))
-
     if not pos:
-        return []
+        return [], []
 
     max_ref = int(cfg.get("graph_max_references_per_seed", 60))
     max_citedby = int(cfg.get("graph_max_citedby_per_seed", 60))
 
-    # 汇总候选 work IDs（OpenAlex Work ID）
-    candidate_ids: list[str] = []
+    refs_ids: list[str] = []
+    citedby_ids: list[str] = []
     seed_doi_urls = set()
 
     for doi in pos:
@@ -339,55 +337,65 @@ def fetch_citation_graph_from_seeds(cfg, mailto: str) -> list[dict]:
         if not w:
             continue
 
-        # 记录 seed DOI，避免把 seed 自己再塞回候选里
         doi_url = w.get("doi")
         if doi_url:
             seed_doi_urls.add(doi_url)
 
-        # 1) references（出引文）
+        # A) references（出引文）
         refs = w.get("referenced_works") or []
         if refs:
-            candidate_ids.extend(refs[:max_ref])
+            refs_ids.extend(refs[:max_ref])
 
-        # 2) citations（入引文）- 通过 cited_by_api_url
+        # B) cited-by（入引文）
         cited_by_url = w.get("cited_by_api_url") or ""
         if cited_by_url:
-            # 只取前一页高引用优先，避免爆量
             params = {"per_page": 100, "sort": "cited_by_count:desc"}
             if mailto:
                 params["mailto"] = mailto
             try:
                 data = openalex_get_url(cited_by_url, params=params)
                 results = data.get("results", []) or []
-                # results 里每项是 work 对象，先拿 id
                 for cw in results[:max_citedby]:
                     oid = cw.get("id")
                     if oid:
-                        candidate_ids.append(oid)
+                        citedby_ids.append(oid)
             except Exception as e:
                 print(f"cited_by fetch failed for seed {doi}: {e}")
 
-    # 去重 + 拉回 works 详情
-    uniq_ids = []
-    seen = set()
-    for oid in candidate_ids:
-        sid = short_openalex_id(oid)
-        if not sid or sid in seen:
-            continue
-        seen.add(sid)
-        uniq_ids.append(sid)
+    def uniq_short_ids(raw_ids: list[str]) -> list[str]:
+        uniq = []
+        seen = set()
+        for oid in raw_ids:
+            sid = short_openalex_id(oid)
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            uniq.append(sid)
+        return uniq
 
-    works = fetch_works_by_openalex_ids(uniq_ids, mailto=mailto, per_page=int(cfg.get("openalex_per_page", 200)))
+    # 批量拉回 works
+    refs_works = fetch_works_by_openalex_ids(
+        uniq_short_ids(refs_ids),
+        mailto=mailto,
+        per_page=int(cfg.get("openalex_per_page", 200))
+    )
+    citedby_works = fetch_works_by_openalex_ids(
+        uniq_short_ids(citedby_ids),
+        mailto=mailto,
+        per_page=int(cfg.get("openalex_per_page", 200))
+    )
 
-    # 过滤掉负例 DOI / seed 自身 DOI
-    filtered = []
-    for w in works:
-        doi_url = w.get("doi") or ""
-        if doi_url and (doi_url in neg or doi_url in seed_doi_urls):
-            continue
-        filtered.append(w)
+    # 过滤负例 DOI 和 seed 本身
+    def drop_neg_and_seed(works: list[dict]) -> list[dict]:
+        out = []
+        for ww in works:
+            d = ww.get("doi") or ""
+            if d and (d in neg or d in seed_doi_urls):
+                continue
+            out.append(ww)
+        return out
 
-    return filtered
+    return drop_neg_and_seed(refs_works), drop_neg_and_seed(citedby_works)
 
 
 
@@ -958,6 +966,9 @@ def fetch_publisher_pools(cfg, mailto: str, publisher_ids: list[str]):
     }).get("results", [])
 
     return pub_latest, pub_classic
+
+
+
 def build_html(
     cfg,
     latest: list[dict],
@@ -967,28 +978,28 @@ def build_html(
     pub_latest: list[dict],
     pub_classic: list[dict],
     pub_map: dict,
-    graph_classic: list[dict],
+    graph_ref_classic: list[dict],
+    graph_citedby_keyfollow: list[dict],
 ) -> str:
     date_str = now_local(cfg["timezone"]).strftime("%Y-%m-%d (%a)")
     build_sha = (os.getenv("GITHUB_SHA", "") or "")[:7]
     run_id = os.getenv("GITHUB_RUN_ID", "")
 
-    # 出版商解析状态（方便排查 IEEE/Elsevier/Springer/Wiley 是否都命中）
     pub_lines = []
     for name, pid in (pub_map or {}).items():
-        if pid:
-            pub_lines.append(f"{name} ✓")
-        else:
-            pub_lines.append(f"{name} ✗")
+        pub_lines.append(f"{name} ✓" if pid else f"{name} ✗")
     pub_status = " / ".join(pub_lines) if pub_lines else "（未配置 preferred_publishers）"
 
     def card(it: dict) -> str:
         title = it.get("title", "")
         abstract = it.get("abstract", "")
-        brief = human_brief_cn(title, abstract).replace("\n", "<br>")
 
-        # 来源标签
-        source_label = "关键词"
+        # ✅ 优先用 LLM 生成的科研简报；没有则回退规则摘要
+        brief_txt = (it.get("llm_brief") or "").strip()
+        if not brief_txt:
+            brief_txt = human_brief_cn(title, abstract)
+        brief = brief_txt.replace("\n", "<br>")
+
         bucket = it.get("bucket")
         if bucket == "reco_s2":
             via = it.get("via", "official_s2")
@@ -999,14 +1010,17 @@ def build_html(
             source_label = "出版商精选-最新"
         elif bucket == "pub_classic":
             source_label = "出版商精选-经典"
-        elif bucket == "graph_classic":
-            source_label = "引用图谱-经典"
+        elif bucket == "graph_ref_classic":
+            source_label = "引用图谱-经典根论文"
+        elif bucket == "graph_citedby_keyfollow":
+            source_label = "引用图谱-关键后续"
         elif bucket == "latest":
             source_label = "最新"
         elif bucket == "classic":
             source_label = "经典"
+        else:
+            source_label = bucket or "未知来源"
 
-        # 主链接：DOI/落地页；PDF 作为按钮
         doi_url = it.get("url") or ""
         pdf_url = it.get("pdf_url") or ""
 
@@ -1053,54 +1067,40 @@ def build_html(
         构建标识：sha={build_sha} run={run_id}
       </p>
 
-      {section(
-          "⭐ S2猜你喜欢（更像“你可能也喜欢”）",
-          reco_s2,
-          "<p>S2 今天没有产出（或被跳过），不影响其他内容。</p>"
-      )}
+      {section("⭐ S2猜你喜欢（更像“你可能也喜欢”）", reco_s2,
+               "<p>S2 今天没有产出（或被跳过），不影响其他内容。</p>")}
 
-      {section(
-          "🧭 OpenAlex脉络（沿你的种子论文 related_works 扩展）",
-          reco_oa,
-          "<p>OpenAlex related_works 今天为空：检查 seeds_positive.txt DOI 是否有效。</p>"
-      )}
+      {section("🧭 OpenAlex脉络（沿你的种子论文 related_works 扩展）", reco_oa,
+               "<p>OpenAlex related_works 今天为空：检查 seeds_positive.txt DOI 是否有效。</p>")}
 
-      {section(
-          "🏷️ 出版商精选-最新（IEEE / Elsevier / Springer / Wiley）",
-          pub_latest,
-          "<p>出版商池“最新”今天为空：可能是 publisher 解析失败、或关键词过窄、或当天返回不足。</p>"
-      )}
+      {section("🏷️ 出版商精选-最新（IEEE / Elsevier / Springer / Wiley）", pub_latest,
+               "<p>出版商池“最新”今天为空：可能是 publisher 解析失败、或关键词过窄、或当天返回不足。</p>")}
 
-      {section(
-          "🏷️ 出版商精选-经典（IEEE / Elsevier / Springer / Wiley）",
-          pub_classic,
-          "<p>出版商池“经典”今天为空：可能是 publisher 解析失败、或 classic 条件过严、或引用阈值设置过高。</p>"
-      )}
+      {section("🏷️ 出版商精选-经典（IEEE / Elsevier / Springer / Wiley）", pub_classic,
+               "<p>出版商池“经典”今天为空：可能是 publisher 解析失败、或 classic 条件过严、或引用阈值设置过高。</p>")}
 
-      {section(
-          "📚 引用图谱挖经典（从 seeds 的 references / citations 扩展）",
-          graph_classic,
-          "<p>引用图谱经典今天为空：可能是 seeds 数量不足、阈值过严（年限/最低引用），或引用图谱抓取失败。</p>"
-      )}
+      {section("📚 引用图谱-经典根论文（references：更像“这方向的地基”）", graph_ref_classic,
+               "<p>引用图谱-根论文今天为空：可能是 seeds 数量不足、阈值过严（年限/最低引用），或图谱抓取失败。</p>")}
 
-      {section(
-          f"🆕 最新进展（全域，近 {cfg['latest_days']} 天）",
-          latest,
-          "<p>今天未抓到足够匹配的最新条目。</p>"
-      )}
+      {section("🛰️ 引用图谱-关键后续（cited-by：更像“重要延展/路线分叉”）", graph_citedby_keyfollow,
+               "<p>引用图谱-关键后续今天为空：可能是 follow_years 太短、最低引用过高，或 seeds 覆盖不足。</p>")}
 
-      {section(
-          "🏛️ 经典/高影响力（全域，两年前及更早）",
-          classic,
-          "<p>今天未抓到足够匹配的经典条目。</p>"
-      )}
+      {section(f"🆕 最新进展（全域，近 {cfg['latest_days']} 天）", latest,
+               "<p>今天未抓到足够匹配的最新条目。</p>")}
+
+      {section("🏛️ 经典/高影响力（全域，两年前及更早）", classic,
+               "<p>今天未抓到足够匹配的经典条目。</p>")}
 
       <hr>
       <p style="color:#888;font-size:12px;">
-        提示：引用图谱栏目更依赖 seeds 的质量与覆盖度；建议逐步把你认可的“根论文/综述/标志性论文”补充进 seeds_positive.txt。
+        提示：引用图谱栏目强依赖 seeds 的质量；建议把你认可的“根论文/综述/标志性论文”逐步补充进 seeds_positive.txt。
       </p>
     </body></html>
     """
+
+
+
+
 
 def send_email(subject: str, html: str):
     host = os.environ["SMTP_HOST"]
@@ -1121,21 +1121,26 @@ def send_email(subject: str, html: str):
         s.login(user, pw)
         s.sendmail(user, [to_email], msg.as_string())
 
+
 def main():
     cfg = load_config()
+
+    # ---- config 必要项检查（一次性）----
     required_cfg = ["topic_cn", "timezone", "send_hour_local", "keywords", "latest_days", "top_latest", "top_classic"]
     for k in required_cfg:
         if k not in cfg:
             raise RuntimeError(f"config.yml missing key: {k}")
 
-        required_env = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "TO_EMAIL"]
-        for k in required_env:
-            if not (os.getenv(k) or "").strip():
-                raise RuntimeError(f"Missing env var: {k}")
+    # ---- env 必要项检查（一次性）----
+    required_env = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS", "TO_EMAIL"]
+    for k in required_env:
+        if not (os.getenv(k) or "").strip():
+            raise RuntimeError(f"Missing env var: {k}")
+
+    # ---- 是否到点发送 ----
     if not should_send_now(cfg):
         print("Not sending now (local hour mismatch).")
         return
-    
 
     mailto = os.getenv("OPENALEX_MAILTO", "")
     seen = load_seen()
@@ -1152,9 +1157,9 @@ def main():
 
     def call_pick_top(items, n):
         try:
-            return pick_top(cfg, items, n)  # 如果你已升级为 pick_top(cfg,...)
+            return pick_top(cfg, items, n)  # 你当前版本是 pick_top(cfg, items, n)
         except TypeError:
-            return pick_top(items, n)       # 兼容旧版 pick_top(items,...)
+            return pick_top(items, n)       # 兼容旧版 pick_top(items, n)
 
     # --------
     # A) 出版商ID解析 + 出版商池子抓取
@@ -1170,7 +1175,7 @@ def main():
         pub_latest_raw, pub_classic_raw = fetch_publisher_pools(cfg, mailto, pub_ids)
 
     # --------
-    # B) 全域关键词：最新 + 经典（只抓一次，去掉你原先重复抓两次的问题）
+    # B) 全域关键词：最新 + 经典
     # --------
     latest_raw, classic_raw = fetch_latest_and_classic(cfg, mailto)
 
@@ -1194,41 +1199,49 @@ def main():
     reco_s2 = pick_top_cited(reco_s2, int(cfg.get("top_reco_s2", 10)))
 
     # --------
-    # D) 出版商精选（放在邮件里“猜你喜欢”之后展示）
+    # D) 出版商精选
     # --------
     pub_latest_items = filter_seen(cfg, dedupe(call_enrich(pub_latest_raw, "pub_latest", publisher_id_set=pub_id_set)), seen)
     pub_classic_items = filter_seen(cfg, dedupe(call_enrich(pub_classic_raw, "pub_classic", publisher_id_set=pub_id_set)), seen)
 
     pub_latest = call_pick_top(pub_latest_items, int(cfg.get("top_pub_latest", 8)))
-    # 经典优先“引用数主导”更稳定
     pub_classic = pick_top_cited(pub_classic_items, int(cfg.get("top_pub_classic", 8)))
 
-
     # --------
-    # C.5) 引用图谱挖经典（references/citations 扩展）
+    # C.5) 引用图谱分桶：
+    #   - graph_ref_classic（根论文/经典）
+    #   - graph_citedby_keyfollow（关键后续/影响扩展）
     # --------
-    graph_raw = fetch_citation_graph_from_seeds(cfg, mailto)
-    graph_items = dedupe(call_enrich(graph_raw, "graph_classic", publisher_id_set=pub_id_set))
-    graph_items = filter_seen(cfg, graph_items, seen)
+    refs_raw, citedby_raw = fetch_graph_buckets_from_seeds(cfg, mailto)
 
-    # 只保留“更经典”的部分（默认：>=5年前；你也可以改成 2/8 年）
-    years_ago = int(cfg.get("graph_classic_years_ago", 5))
+    # A) 根论文/经典（references）
+    ref_items = dedupe(call_enrich(refs_raw, "graph_ref_classic", publisher_id_set=pub_id_set))
+    ref_items = filter_seen(cfg, ref_items, seen)
+
+    years_ago = int(cfg.get("graph_ref_classic_years_ago", 5))
     year_cut = dt.date.today().year - years_ago
-    graph_items = [x for x in graph_items if (x.get("publication_year") or 9999) <= year_cut]
+    ref_items = [x for x in ref_items if (x.get("publication_year") or 9999) <= year_cut]
 
-    # 再加一个“最低引用门槛”避免低质量噪声
-    min_cites = int(cfg.get("graph_min_cited_by", 30))
-    graph_items = [x for x in graph_items if int(x.get("cited_by_count", 0) or 0) >= min_cites]
+    min_cites = int(cfg.get("graph_ref_min_cited_by", 30))
+    ref_items = [x for x in ref_items if int(x.get("cited_by_count", 0) or 0) >= min_cites]
 
-    # 经典优先：引用数主导更符合“根论文”目标
-    graph_classic = pick_top_cited(graph_items, int(cfg.get("top_graph_classic", 10)))
+    graph_ref_classic = pick_top_cited(ref_items, int(cfg.get("top_graph_ref_classic", 10)))
 
+    # B) 关键后续（cited-by）
+    cited_items = dedupe(call_enrich(citedby_raw, "graph_citedby_keyfollow", publisher_id_set=pub_id_set))
+    cited_items = filter_seen(cfg, cited_items, seen)
 
+    follow_years = int(cfg.get("graph_follow_years", 3))
+    follow_cut = dt.date.today().year - follow_years
+    cited_items = [x for x in cited_items if (x.get("publication_year") or 0) >= follow_cut]
 
+    follow_min_cites = int(cfg.get("graph_follow_min_cited_by", 10))
+    cited_items = [x for x in cited_items if int(x.get("cited_by_count", 0) or 0) >= follow_min_cites]
 
-    
+    graph_citedby_keyfollow = call_pick_top(cited_items, int(cfg.get("top_graph_citedby_keyfollow", 10)))
+
     # --------
-    # E) Unpaywall 全文链接（你已有）
+    # E) Unpaywall 全文链接
     # --------
     latest = attach_fulltext_links(cfg, latest)
     classic = attach_fulltext_links(cfg, classic)
@@ -1236,28 +1249,39 @@ def main():
     reco_oa = attach_fulltext_links(cfg, reco_oa)
     pub_latest = attach_fulltext_links(cfg, pub_latest)
     pub_classic = attach_fulltext_links(cfg, pub_classic)
-    graph_classic = attach_fulltext_links(cfg, graph_classic)
+    graph_ref_classic = attach_fulltext_links(cfg, graph_ref_classic)
+    graph_citedby_keyfollow = attach_fulltext_links(cfg, graph_citedby_keyfollow)
+
+    # ✅ 删除：graph_classic 未定义，会 NameError
+    # graph_classic = attach_fulltext_links(cfg, graph_classic)
 
     # --------
     # F) 生成HTML并发送
     # --------
-    html = build_html(cfg, latest, classic, reco_s2, reco_oa, pub_latest, pub_classic, pub_map, graph_classic)
+    html = build_html(
+        cfg, latest, classic, reco_s2, reco_oa,
+        pub_latest, pub_classic, pub_map,
+        graph_ref_classic, graph_citedby_keyfollow
+    )
     subject = f"[每日科研简报] {cfg['topic_cn']} | {now_local(cfg['timezone']).strftime('%Y-%m-%d')}"
     send_email(subject, html)
 
     # --------
-    # G) 写回 seen（把今天发过的都记住，包括出版商精选）
+    # G) 写回 seen（把今天发过的都记住）
     # --------
     today_str = dt.date.today().isoformat()
-    for lst in [latest, classic, reco_s2, reco_oa, pub_latest, pub_classic, graph_classic]:
+    for lst in [latest, classic, reco_s2, reco_oa, pub_latest, pub_classic, graph_ref_classic, graph_citedby_keyfollow]:
         for it in lst:
             k = it.get("doi") or it.get("url") or it.get("title")
             if k:
                 seen[k] = today_str
     save_seen(seen)
+
     print(f"DEBUG seen saved: {len(seen)}")
     print("Email sent.")
 
+
+        
 
 if __name__ == "__main__":
     main()
