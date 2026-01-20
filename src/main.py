@@ -346,7 +346,7 @@ def fetch_s2_recommendations_from_seeds(cfg) -> list[dict]:
     if not positive:
         return []
 
-    url = "https://api.semanticscholar.org/recommendations/v1/papers/"
+    url = "https://api.semanticscholar.org/recommendations/v1/papers"
     params = {
         "fields": "title,abstract,year,citationCount,venue,externalIds,url",
         "limit": int(cfg.get("s2_limit", 20)),
@@ -694,6 +694,7 @@ def enrich_s2(cfg, papers: list[dict], tag: str = "reco_s2") -> list[dict]:
             "url": url or doi_url,
             "relevance": relevance_score(title, abstract, cfg["keywords"]),
             "bucket": tag,  # reco_s2
+            "via": p.get("_via", "official_s2"),
         })
     return out
 
