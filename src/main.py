@@ -731,7 +731,217 @@ def fetch_ai4s_recommendations_from_seeds(cfg) -> tuple[bool, list[dict]]:
     return (False, [])
 
 
+# -------------------------
+# LLM Brief via OpenRouter
+# -------------------------
 
+def openrouter_headers() -> dict | None:
+    key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not key:
+        return None
+    h = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    site = (os.getenv("OPENROUTER_SITE_URL") or "").strip()
+    app = (os.getenv("OPENROUTER_APP_NAME") or "").strip()
+    # OpenRouter docs recommend these optional headers
+    if site:
+        h["HTTP-Referer"] = site
+    if app:
+        h["X-Title"] = app
+    return h
+
+
+def openrouter_chat(cfg, messages: list[dict]) -> str:
+    """
+    POST /api/v1/chat/completions (OpenAI-compatible)
+    Docs: https://openrouter.ai/docs/api/api-reference/chat/send-chat-completion-request
+    """
+    headers = openrouter_headers()
+    if not headers:
+        raise RuntimeError("OPENROUTER_API_KEY missing")
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    payload = {
+        "model": cfg.get("openrouter_model", "openai/gpt-4.1-mini"),
+        "messages": messages,
+        "temperature": float(cfg.get("llm_temperature", 0.2)),
+        "max_tokens": int(cfg.get("llm_max_tokens", 520)),
+        "stream": False,
+    }
+
+    retries = int(cfg.get("llm_retries", 2))
+    backoff = int(cfg.get("llm_backoff_sec", 3))
+    timeout = int(cfg.get("llm_timeout_sec", 60))
+
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout)
+
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                if attempt < retries:
+                    sleep_s = backoff * (2 ** attempt)
+                    print(f"OpenRouter rate-limited/server error ({r.status_code}); retry in {sleep_s}s")
+                    time.sleep(sleep_s)
+                    continue
+                raise RuntimeError(f"OpenRouter failed status={r.status_code}: {r.text[:200]}")
+
+            r.raise_for_status()
+            data = r.json()
+            # OpenAI-style
+            return (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content", "").strip()
+
+        except Exception as e:
+            if attempt < retries:
+                sleep_s = backoff * (2 ** attempt)
+                print(f"OpenRouter exception: {e}; retry in {sleep_s}s")
+                time.sleep(sleep_s)
+                continue
+            raise
+
+
+def load_llm_cache(path: str) -> dict:
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_llm_cache(cache: dict, path: str):
+    if not path:
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+
+def llm_cache_key(it: dict) -> str:
+    # 优先 DOI，其次 url，其次 title
+    return (it.get("doi") or it.get("url") or it.get("title") or "").strip()
+
+
+def build_llm_prompt_cn(it: dict) -> list[dict]:
+    """
+    生成“中文科研简报”，禁止臆测：只能基于给定元数据与摘要。
+    """
+    title = (it.get("title") or "").strip()
+    abstract = (it.get("abstract") or "").strip()
+    venue = (it.get("venue") or "").strip()
+    year = it.get("publication_year") or ""
+    cites = it.get("cited_by_count") or 0
+    doi = it.get("doi") or ""
+    url = it.get("url") or ""
+    pdf = it.get("pdf_url") or ""
+    bucket = it.get("bucket") or ""
+
+    sys = (
+        "你是我的研究助理。"
+        "请只基于我提供的论文元数据与摘要，生成“中文科研简报”。"
+        "严禁编造论文中不存在的实验、指标、结论。"
+        "若摘要信息不足，请明确写“信息不足/需读全文”。"
+        "风格：像人写的科研简报，讲人话但保持专业。"
+    )
+
+    user = f"""请为下列论文生成中文科研简报（不超过 180~260 中文字），格式固定为：
+
+【一句话】……
+【做了什么】……
+【怎么做】……
+【结果/贡献】……
+【局限/注意】……
+【我该怎么用】（结合“结温在线监测/估算”工程链路给一个建议）
+
+元数据：
+- 标题：{title}
+- 来源/期刊/会议：{venue}
+- 年份：{year}
+- 引用：{cites}
+- DOI：{doi}
+- 主页：{url}
+- PDF：{pdf if pdf else "无"}
+- 分类桶：{bucket}
+
+摘要：
+{abstract if abstract else "（无摘要）"}
+"""
+
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user},
+    ]
+
+
+def llm_brief_cn(cfg, it: dict) -> str:
+    msgs = build_llm_prompt_cn(it)
+    return openrouter_chat(cfg, msgs)
+
+
+def apply_llm_briefs(cfg, lists: list[list[dict]]) -> None:
+    """
+    对多个列表中的条目，挑选 Top-N 做 LLM 简报，并写回 it["brief_cn"]。
+    有缓存：llm_cache.json
+    """
+    if not cfg.get("use_llm_brief", False):
+        return
+
+    headers = openrouter_headers()
+    if not headers:
+        print("LLM brief enabled but OPENROUTER_API_KEY missing; fallback to rule-based briefs.")
+        return
+
+    max_n = int(cfg.get("llm_max_items_per_run", 18))
+    cache_path = cfg.get("llm_cache_file", "llm_cache.json")
+    cache = load_llm_cache(cache_path)
+
+    # 合并候选并按“已有的排序信号”选 Top-N：优先引用多、相关性高
+    pool = []
+    for lst in lists:
+        for it in lst:
+            k = llm_cache_key(it)
+            if not k:
+                continue
+            # 已经有 brief 就跳过
+            if it.get("brief_cn"):
+                continue
+            # cache 命中则直接写回
+            if k in cache and (cache[k] or "").strip():
+                it["brief_cn"] = cache[k]
+                continue
+
+            # 评分：引用数开方 + relevance
+            cites = int(it.get("cited_by_count", 0) or 0)
+            rel = int(it.get("relevance", 0) or 0)
+            score = (int(cites ** 0.5) * 10) + (rel * 8)
+            pool.append((score, it))
+
+    pool.sort(key=lambda x: x[0], reverse=True)
+    picked = [it for _, it in pool[:max_n]]
+
+    print(f"LLM briefs: need_generate={len(picked)} max_per_run={max_n}")
+
+    for idx, it in enumerate(picked, 1):
+        k = llm_cache_key(it)
+        try:
+            brief = llm_brief_cn(cfg, it)
+            # 简单兜底：空就回退
+            if not brief.strip():
+                brief = human_brief_cn(it.get("title",""), it.get("abstract",""))
+            it["brief_cn"] = brief
+            cache[k] = brief
+            print(f"LLM briefs: ok {idx}/{len(picked)} key={k[:32]}")
+        except Exception as e:
+            print(f"LLM briefs: failed key={k[:32]} err={e}; fallback to rule-based")
+            it["brief_cn"] = human_brief_cn(it.get("title",""), it.get("abstract",""))
+
+        # 小睡避免触发限流
+        time.sleep(0.25)
+
+    save_llm_cache(cache, cache_path)
 
 
 
@@ -995,10 +1205,10 @@ def build_html(
         abstract = it.get("abstract", "")
 
         # ✅ 优先用 LLM 生成的科研简报；没有则回退规则摘要
-        brief_txt = (it.get("llm_brief") or "").strip()
-        if not brief_txt:
-            brief_txt = human_brief_cn(title, abstract)
-        brief = brief_txt.replace("\n", "<br>")
+        brief_src = (it.get("brief_cn") or "").strip()
+        if not brief_src:
+            brief_src = human_brief_cn(title, abstract)
+        brief = brief_src.replace("\n", "<br>")
 
         bucket = it.get("bucket")
         if bucket == "reco_s2":
@@ -1255,9 +1465,23 @@ def main():
     # ✅ 删除：graph_classic 未定义，会 NameError
     # graph_classic = attach_fulltext_links(cfg, graph_classic)
 
+
+    # --------
+    # LLM 简报（OpenRouter）
+    # 只对“入选发邮件的条目”做 Top-N 调用，控制成本，并带缓存
+    # --------
+    apply_llm_briefs(cfg, [
+        reco_s2, reco_oa,
+        pub_latest, pub_classic,
+        graph_ref_classic, graph_citedby_keyfollow,
+        latest, classic
+    ])
+
+
     # --------
     # F) 生成HTML并发送
     # --------
+
     html = build_html(
         cfg, latest, classic, reco_s2, reco_oa,
         pub_latest, pub_classic, pub_map,

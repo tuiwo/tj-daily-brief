@@ -59,6 +59,22 @@ graph_min_cited_by: 30
 top_graph_classic: 10
 
 
+# --- LLM 简报（OpenRouter）---
+use_llm_brief: true
+openrouter_model: "xiaomi/mimo-v2-flash:free"   # 你可随时换成 anthropic/claude... 或其他
+llm_temperature: 0.2
+llm_max_tokens: 520
+llm_timeout_sec: 60
+llm_retries: 2
+llm_backoff_sec: 3
+
+# 每天最多给多少篇论文生成 LLM 简报（控制成本）
+llm_max_items_per_run: 18
+
+# 缓存文件（建议保留）
+llm_cache_file: "llm_cache.json"
+
+
 keywords:
   - "junction temperature"
   - "Tj"
