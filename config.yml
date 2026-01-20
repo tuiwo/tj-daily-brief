@@ -51,7 +51,12 @@ doaj_penalty: 2
 openalex_per_page: 200
 
 
-
+# 引用图谱扩展（经典优先）
+graph_max_references_per_seed: 60
+graph_max_citedby_per_seed: 60
+graph_classic_years_ago: 5
+graph_min_cited_by: 30
+top_graph_classic: 10
 
 
 keywords:
