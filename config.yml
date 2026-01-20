@@ -26,6 +26,34 @@ prefer_recent_days: 180
 
 
 
+
+# --- 质量改造：出版商优先池 ---
+preferred_publishers:
+  - IEEE
+  - Elsevier
+  - Springer Nature
+  - Wiley
+
+# 你想在邮件里单独展示“出版商精选”吗
+enable_publisher_pools: true
+
+# 出版商池子里每天取多少条（建议：最新 6~10，经典 6~10）
+top_pub_latest: 8
+top_pub_classic: 8
+
+# 出版商加分（越大越偏向四大）
+publisher_boost: 6
+
+# DOAJ 轻微降权（不做硬过滤，避免误伤）
+doaj_penalty: 2
+
+# OpenAlex 每个查询拉多少条（建议 100~200）
+openalex_per_page: 200
+
+
+
+
+
 keywords:
   - "junction temperature"
   - "Tj"

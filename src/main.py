@@ -577,7 +577,9 @@ def fetch_ai4s_recommendations_from_seeds(cfg) -> tuple[bool, list[dict]]:
 # -------------------------
 # enrich / 去重 / 排序
 # -------------------------
-def enrich(cfg, works: list[dict], tag: str = "") -> list[dict]:
+def enrich(cfg, works: list[dict], tag: str = "", publisher_id_set: set[str] | None = None) -> list[dict]:
+    publisher_id_set = publisher_id_set or set()
+
     out = []
     for w in works:
         title = w.get("title") or ""
@@ -585,18 +587,25 @@ def enrich(cfg, works: list[dict], tag: str = "") -> list[dict]:
         if excluded(title, abstract, cfg.get("exclude_keywords", [])):
             continue
 
+        src = ((w.get("primary_location") or {}).get("source") or {})
+        host_org = src.get("host_organization") or ""   # e.g. "https://openalex.org/P...."
+        is_in_doaj = bool(src.get("is_in_doaj", False))
+
         out.append({
             "title": title,
             "abstract": abstract,
             "publication_year": w.get("publication_year"),
             "publication_date": w.get("publication_date"),
             "cited_by_count": w.get("cited_by_count", 0) or 0,
-            "venue": (((w.get("primary_location") or {}).get("source") or {}).get("display_name")) or "",
+            "venue": src.get("display_name") or "",
             "doi": w.get("doi"),
             "url": pick_best_url(w),
             "relevance": relevance_score(title, abstract, cfg["keywords"]),
-            "bucket": tag,  # latest / classic / reco
-            "via": w.get("_via", "official_s2"),
+            "bucket": tag,
+            "host_org": host_org,
+            "is_in_doaj": is_in_doaj,
+            "publisher_hit": (host_org in publisher_id_set) if host_org else False,
+            "via": w.get("_via", "openalex"),
         })
     return out
 
@@ -656,11 +665,20 @@ def filter_seen(cfg, items: list[dict], seen: dict) -> list[dict]:
     return out
 
 
+def rank_score(cfg, it: dict) -> int:
+    score = int(it.get("relevance", 0)) * 10
+    score += int(it.get("cited_by_count", 0) ** 0.5) * 3  # 引用数做“开方”避免极端值碾压
 
+    if it.get("publisher_hit"):
+        score += int(cfg.get("publisher_boost", 6)) * 10
 
-def pick_top(items: list[dict], n: int) -> list[dict]:
-    # 简单可用：相关性优先，再看引用数
-    items = sorted(items, key=lambda x: (x["relevance"], x["cited_by_count"]), reverse=True)
+    if it.get("is_in_doaj"):
+        score -= int(cfg.get("doaj_penalty", 2)) * 10
+
+    return score
+
+def pick_top(cfg, items: list[dict], n: int) -> list[dict]:
+    items = sorted(items, key=lambda x: rank_score(cfg, x), reverse=True)
     return items[:n]
 
 
@@ -699,23 +717,119 @@ def enrich_s2(cfg, papers: list[dict], tag: str = "reco_s2") -> list[dict]:
     return out
 
 
+PUBLISHER_CACHE = "publisher_ids.json"
 
-# -------------------------
-# 邮件 HTML
-# -------------------------
+def openalex_get_json(url: str, params: dict, timeout: int = 60) -> dict:
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def resolve_publishers_openalex_ids(names: list[str], mailto: str = "") -> dict[str, str]:
+    """
+    返回：{ "Elsevier": "https://openalex.org/Pxxxx", ... }
+    结果会写入 publisher_ids.json 缓存，减少每天查询次数。
+    """
+    # 读缓存
+    if os.path.exists(PUBLISHER_CACHE):
+        try:
+            with open(PUBLISHER_CACHE, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+        except Exception:
+            cached = {}
+    else:
+        cached = {}
+
+    out = dict(cached)
+    changed = False
+
+    for name in names:
+        if name in out and out[name].startswith("https://openalex.org/P"):
+            continue
+
+        params = {"search": name, "per_page": 5}
+        if mailto:
+            params["mailto"] = mailto
+
+        data = openalex_get_json("https://api.openalex.org/publishers", params=params)
+        results = data.get("results", []) or []
+        # 选最像的一个（简单策略：第一个）
+        if results:
+            out[name] = results[0].get("id", "")
+            changed = True
+        else:
+            out[name] = ""
+            changed = True
+
+        time.sleep(0.12)
+
+    if changed:
+        with open(PUBLISHER_CACHE, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+
+    return out
+
+def fetch_publisher_pools(cfg, mailto: str, publisher_ids: list[str]):
+    """
+    返回：pub_latest_raw, pub_classic_raw
+    """
+    if not publisher_ids:
+        return [], []
+
+    query = cfg.get("search_query") or " ".join(cfg["keywords"][:6])
+
+    today = dt.date.today()
+    from_date = (today - dt.timedelta(days=int(cfg["latest_days"]))).isoformat()
+    classic_to = (today - dt.timedelta(days=365 * 2)).isoformat()
+
+    common_filter = "type:journal-article|proceedings-article"
+
+    per_page = int(cfg.get("openalex_per_page", 200))
+    base = {"search": query, "per_page": per_page}
+    if mailto:
+        base["mailto"] = mailto
+
+    # OR 语法用 | 连接（OpenAlex 常用）
+    pubs_or = "|".join(publisher_ids)
+
+    pub_latest = openalex_get({
+        **base,
+        "filter": f"from_publication_date:{from_date},primary_location.source.host_organization:{pubs_or},{common_filter}",
+        "sort": "cited_by_count:desc",
+    }).get("results", [])
+
+    pub_classic = openalex_get({
+        **base,
+        "filter": f"to_publication_date:{classic_to},primary_location.source.host_organization:{pubs_or},{common_filter}",
+        "sort": "cited_by_count:desc",
+    }).get("results", [])
+
+    return pub_latest, pub_classic
+
 def build_html(
     cfg,
     latest: list[dict],
     classic: list[dict],
     reco_s2: list[dict],
     reco_oa: list[dict],
+    pub_latest: list[dict],
+    pub_classic: list[dict],
+    pub_map: dict,
 ) -> str:
     date_str = now_local(cfg["timezone"]).strftime("%Y-%m-%d (%a)")
     build_sha = (os.getenv("GITHUB_SHA", "") or "")[:7]
     run_id = os.getenv("GITHUB_RUN_ID", "")
-    
+
+    # 展示“出版商解析情况”，方便你排查是否识别到了 IEEE/Elsevier/Springer/Wiley
+    pub_lines = []
+    for name, pid in (pub_map or {}).items():
+        if pid:
+            pub_lines.append(f"{name} ✓")
+        else:
+            pub_lines.append(f"{name} ✗")
+    pub_status = " / ".join(pub_lines) if pub_lines else "（未配置 preferred_publishers）"
+
     def card(it: dict) -> str:
-        brief = human_brief_cn(it["title"], it["abstract"]).replace("\n", "<br>")
+        brief = human_brief_cn(it.get("title", ""), it.get("abstract", "")).replace("\n", "<br>")
 
         # 来源标签
         source_label = "关键词"
@@ -724,14 +838,15 @@ def build_html(
             source_label = "S2猜你喜欢(ai4scholar)" if via == "ai4scholar" else "S2猜你喜欢(官方)"
         elif it.get("bucket") == "reco_oa":
             source_label = "OpenAlex相关"
-        elif it.get("bucket") == "reco":
-            source_label = "推荐"
+        elif it.get("bucket") == "pub_latest":
+            source_label = "出版商精选-最新"
+        elif it.get("bucket") == "pub_classic":
+            source_label = "出版商精选-经典"
         elif it.get("bucket") == "latest":
             source_label = "最新"
         elif it.get("bucket") == "classic":
             source_label = "经典"
 
-        # 标题永远指向 DOI/落地页；PDF 作为可选按钮
         doi_url = it.get("url") or ""
         pdf_url = it.get("pdf_url") or ""
 
@@ -747,23 +862,23 @@ def build_html(
         return f"""
         <div style="margin:14px 0;padding:12px;border:1px solid #ddd;border-radius:10px;">
           <div style="font-size:16px;font-weight:700;">
-            <a href="{doi_url}" target="_blank" rel="noreferrer">{it['title']}</a>
+            <a href="{doi_url}" target="_blank" rel="noreferrer">{it.get('title','')}</a>
             {pdf_btn}
           </div>
           <div style="color:#555;margin-top:6px;">
-            {it['venue'] or 'Unknown venue'} · {it['publication_year'] or ''} · 引用 {it['cited_by_count']} · relevance {it['relevance']} · 来源 {source_label} · 全文 {"PDF" if pdf_url else "无"}
+            {it.get('venue') or 'Unknown venue'} · {it.get('publication_year') or ''} · 引用 {it.get('cited_by_count',0)} · relevance {it.get('relevance',0)} · 来源 {source_label} · 全文 {"PDF" if pdf_url else "无"}
           </div>
           <div style="margin-top:10px;line-height:1.55;">{brief}</div>
         </div>
         """
 
-
-    reco_days = ""
     return f"""
     <html><body style="font-family:Arial, Helvetica, sans-serif;">
       <h2>{cfg['topic_cn']} — 每日科研简报（{date_str}）</h2>
       <p style="color:#666;">
-        数据源：OpenAlex（works 搜索 + 引用数 + related_works 推荐）。建议带 OPENALEX_MAILTO 做 polite usage。<br>
+        数据源：OpenAlex（works 搜索 + 引用数 + related_works 推荐）/ Semantic Scholar（或 ai4scholar）。<br>
+        出版商池：按 primary_location.source.host_organization 过滤（Publisher级），用于提升 IEEE/Elsevier/Springer/Wiley 覆盖。<br>
+        识别状态：{pub_status}<br>
         构建标识：sha={build_sha} run={run_id}
       </p>
 
@@ -773,15 +888,21 @@ def build_html(
       <h3>🧭 OpenAlex脉络（沿你的种子论文相关图谱扩展）</h3>
       {''.join(card(x) for x in reco_oa) if reco_oa else '<p>OpenAlex related_works 今天为空：检查 seeds_positive.txt DOI 是否有效。</p>'}
 
-      <h3>🆕 最新进展（近 {cfg['latest_days']} 天）</h3>
+      <h3>🏷️ 出版商精选-最新（IEEE / Elsevier / Springer / Wiley）</h3>
+      {''.join(card(x) for x in pub_latest) if pub_latest else '<p>出版商池“最新”今天为空：可能是 publisher 解析失败、或关键词过窄。</p>'}
+
+      <h3>🏷️ 出版商精选-经典（IEEE / Elsevier / Springer / Wiley）</h3>
+      {''.join(card(x) for x in pub_classic) if pub_classic else '<p>出版商池“经典”今天为空：可能是 publisher 解析失败、或 classic 条件过严。</p>'}
+
+      <h3>🆕 最新进展（全域，近 {cfg['latest_days']} 天）</h3>
       {''.join(card(x) for x in latest) if latest else '<p>今天未抓到足够匹配的最新条目。</p>'}
 
-      <h3>🏛️ 经典/高影响力（两年前及更早）</h3>
+      <h3>🏛️ 经典/高影响力（全域，两年前及更早）</h3>
       {''.join(card(x) for x in classic) if classic else '<p>今天未抓到足够匹配的经典条目。</p>'}
 
       <hr>
       <p style="color:#888;font-size:12px;">
-        下一阶段：接入 Semantic Scholar Recommendations（支持正/负例更懂你），并把摘要升级为“可选大模型生成（只对 Top-N 调用，控制 token 成本）”。
+        下一阶段建议：从 seed 的引用图谱扩展（references/citations）挖“经典根论文”，比关键词搜索更容易命中闭源顶刊与基础工作。
       </p>
     </body></html>
     """
@@ -806,7 +927,6 @@ def send_email(subject: str, html: str):
         s.login(user, pw)
         s.sendmail(user, [to_email], msg.as_string())
 
-
 def main():
     cfg = load_config()
     if not should_send_now(cfg):
@@ -817,48 +937,90 @@ def main():
     seen = load_seen()
     print(f"DEBUG seen loaded: {len(seen)}")
 
-    # 1) 关键词：最新 + 经典
-    # 1) 关键词：最新 + 经典
+    # --------
+    # 兼容层：有些函数你可能已经改了签名（比如 enrich/pick_top）
+    # --------
+    def call_enrich(works, tag, publisher_id_set=None):
+        try:
+            return enrich(cfg, works, tag, publisher_id_set=publisher_id_set)
+        except TypeError:
+            return enrich(cfg, works, tag)
+
+    def call_pick_top(items, n):
+        try:
+            return pick_top(cfg, items, n)  # 如果你已升级为 pick_top(cfg,...)
+        except TypeError:
+            return pick_top(items, n)       # 兼容旧版 pick_top(items,...)
+
+    # --------
+    # A) 出版商ID解析 + 出版商池子抓取
+    # --------
+    pub_names = cfg.get("preferred_publishers", [])
+    pub_map = resolve_publishers_openalex_ids(pub_names, mailto)
+    pub_ids = [v for v in pub_map.values() if v and v.startswith("https://openalex.org/P")]
+    pub_id_set = set(pub_ids)
+    print(f"DEBUG publishers: {pub_map}")
+
+    pub_latest_raw, pub_classic_raw = ([], [])
+    if cfg.get("enable_publisher_pools", True) and pub_ids:
+        pub_latest_raw, pub_classic_raw = fetch_publisher_pools(cfg, mailto, pub_ids)
+
+    # --------
+    # B) 全域关键词：最新 + 经典（只抓一次，去掉你原先重复抓两次的问题）
+    # --------
     latest_raw, classic_raw = fetch_latest_and_classic(cfg, mailto)
-    latest_items = filter_seen(cfg, dedupe(enrich(cfg, latest_raw, "latest")), seen)
-    classic_items = filter_seen(cfg, dedupe(enrich(cfg, classic_raw, "classic")), seen)
-    latest = pick_top(latest_items, int(cfg["top_latest"]))
-    classic = pick_top(classic_items, int(cfg["top_classic"]))
 
-    # 2) Milestone B：DOI seeds -> related_works 推荐
-    # OpenAlex 推荐（你已完成）
+    latest_items = filter_seen(cfg, dedupe(call_enrich(latest_raw, "latest", publisher_id_set=pub_id_set)), seen)
+    classic_items = filter_seen(cfg, dedupe(call_enrich(classic_raw, "classic", publisher_id_set=pub_id_set)), seen)
+
+    latest = call_pick_top(latest_items, int(cfg["top_latest"]))
+    classic = call_pick_top(classic_items, int(cfg["top_classic"]))
+
+    # --------
+    # C) 推荐：OpenAlex related_works + S2 / ai4scholar
+    # --------
     reco_oa_raw = fetch_recommendations_from_seeds(cfg, mailto)
-    reco_oa = dedupe(enrich(cfg, reco_oa_raw, "reco_oa"))
-    reco_oa = filter_seen(cfg,reco_oa,seen)
+    reco_oa = dedupe(call_enrich(reco_oa_raw, "reco_oa", publisher_id_set=pub_id_set))
+    reco_oa = filter_seen(cfg, reco_oa, seen)
     reco_oa = pick_top_cited(reco_oa, int(cfg.get("top_reco_oa", 10)))
-    
-    # S2 推荐（无 key 也尝试；失败会自动跳过）
-    reco_s2_raw = fetch_s2_recommendations_from_seeds(cfg)
-    reco_s2 = dedupe(enrich_s2(cfg, reco_s2_raw, "reco_s2"))
-    reco_s2 = filter_seen(cfg,reco_s2,seen)
-    reco_s2 = pick_top_cited(reco_s2, int(cfg.get("top_reco_s2", 10)))
-    
-    # 合并去重
-    reco_all = dedupe(reco_s2 + reco_oa)
-    
-    # 轻微偏向 S2（因为更像“猜你喜欢”）；无 S2 数据也不影响
-    for it in reco_all:
-        if it.get("bucket") == "reco_s2":
-            it["relevance"] += 2
-    
-    reco = pick_top(reco_all, int(cfg.get("top_reco", 3)))
 
+    reco_s2_raw = fetch_s2_recommendations_from_seeds(cfg)  # ai4scholar 成功会在内部 skip 官方S2
+    reco_s2 = dedupe(enrich_s2(cfg, reco_s2_raw, "reco_s2"))
+    reco_s2 = filter_seen(cfg, reco_s2, seen)
+    reco_s2 = pick_top_cited(reco_s2, int(cfg.get("top_reco_s2", 10)))
+
+    # --------
+    # D) 出版商精选（放在邮件里“猜你喜欢”之后展示）
+    # --------
+    pub_latest_items = filter_seen(cfg, dedupe(call_enrich(pub_latest_raw, "pub_latest", publisher_id_set=pub_id_set)), seen)
+    pub_classic_items = filter_seen(cfg, dedupe(call_enrich(pub_classic_raw, "pub_classic", publisher_id_set=pub_id_set)), seen)
+
+    pub_latest = call_pick_top(pub_latest_items, int(cfg.get("top_pub_latest", 8)))
+    # 经典优先“引用数主导”更稳定
+    pub_classic = pick_top_cited(pub_classic_items, int(cfg.get("top_pub_classic", 8)))
+
+    # --------
+    # E) Unpaywall 全文链接（你已有）
+    # --------
     latest = attach_fulltext_links(cfg, latest)
     classic = attach_fulltext_links(cfg, classic)
     reco_s2 = attach_fulltext_links(cfg, reco_s2)
     reco_oa = attach_fulltext_links(cfg, reco_oa)
+    pub_latest = attach_fulltext_links(cfg, pub_latest)
+    pub_classic = attach_fulltext_links(cfg, pub_classic)
 
-    html = build_html(cfg, latest, classic, reco_s2, reco_oa)
+    # --------
+    # F) 生成HTML并发送
+    # --------
+    html = build_html(cfg, latest, classic, reco_s2, reco_oa, pub_latest, pub_classic, pub_map)
     subject = f"[每日科研简报] {cfg['topic_cn']} | {now_local(cfg['timezone']).strftime('%Y-%m-%d')}"
-
     send_email(subject, html)
+
+    # --------
+    # G) 写回 seen（把今天发过的都记住，包括出版商精选）
+    # --------
     today_str = dt.date.today().isoformat()
-    for lst in [latest, classic, reco_s2, reco_oa]:
+    for lst in [latest, classic, reco_s2, reco_oa, pub_latest, pub_classic]:
         for it in lst:
             k = it.get("doi") or it.get("url") or it.get("title")
             if k:
