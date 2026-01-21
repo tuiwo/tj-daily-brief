@@ -16,6 +16,12 @@ from email.mime.text import MIMEText
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent   # repo 根目录（src 的上一级）
+
+def resolve_path(p: str | Path) -> Path:
+    p = Path(p)
+    return p if p.is_absolute() else (PROJECT_ROOT / p)
+
 
 # OpenAlex paging: per-page is 1..200
 OPENALEX_PER_PAGE_MIN = 1
@@ -31,10 +37,6 @@ POLITE_SLEEP_SEC = 0.12
 # -------------------------
 # Small utils
 # -------------------------
-def resolve_path(p: str | Path) -> Path:
-    p = Path(p)
-    return p if p.is_absolute() else (SCRIPT_DIR / p)
-
 
 def now_local(tz: str) -> dt.datetime:
     return dt.datetime.now(ZoneInfo(tz))
