@@ -458,10 +458,20 @@ def relevance_score(title: str, abstract: str, keywords: list[str]) -> int:
     return score
 
 
+
 def excluded(title: str, abstract: str, exclude_keywords: list[str]) -> bool:
     t = normalize(title)
     a = normalize(abstract)
-    return any((k or "").lower() in t or (k or "").lower() in a for k in (exclude_keywords or []))
+    for k in (exclude_keywords or []):
+        kk = (k or "").strip().lower()
+        if not kk:
+            continue
+        if kk in t or kk in a:
+            return True
+    return False
+
+
+
 
 
 def extract_numbers(text: str) -> str:
