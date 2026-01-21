@@ -32,7 +32,19 @@ jobs:
 
       - name: Debug schedule string
         run: echo "github.event.schedule=${{ github.event.schedule }}"
-
+        
+      - name: Debug seeds files
+        run: |
+          pwd
+          ls -la
+          ls -ლა src
+          find . -maxdepth 4 -name "seeds_positive.txt" -o -name "seeds_negative.txt"
+          echo "---- show first 50 lines ----"
+          for f in $(find . -maxdepth 6 -name "seeds_positive.txt"); do
+            echo "==== $f ===="
+            sed -n '1,50p' "$f"
+          done
+          
       - name: Run
         run: python src/main.py
         env:
