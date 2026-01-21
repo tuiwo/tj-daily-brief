@@ -36,6 +36,7 @@ jobs:
       - name: Run
         run: python src/main.py
         env:
+          OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
