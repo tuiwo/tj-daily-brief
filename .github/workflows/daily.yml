@@ -37,7 +37,7 @@ jobs:
         run: |
           pwd
           ls -la
-          ls -ლა src
+          ls -a src
           find . -maxdepth 4 -name "seeds_positive.txt" -o -name "seeds_negative.txt"
           echo "---- show first 50 lines ----"
           for f in $(find . -maxdepth 6 -name "seeds_positive.txt"); do
