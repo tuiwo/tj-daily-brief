@@ -764,7 +764,7 @@ def openrouter_chat(cfg, messages: list[dict]) -> str:
 
     url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
-        "model": cfg.get("openrouter_model", "openai/gpt-4.1-mini"),
+        "model": cfg.get("openrouter_model", "z-ai/glm-4.5-air:free"),
         "messages": messages,
         "temperature": float(cfg.get("llm_temperature", 0.2)),
         "max_tokens": int(cfg.get("llm_max_tokens", 520)),
@@ -1177,8 +1177,6 @@ def fetch_publisher_pools(cfg, mailto: str, publisher_ids: list[str]):
 
     return pub_latest, pub_classic
 
-
-
 def build_html(
     cfg,
     latest: list[dict],
@@ -1195,119 +1193,334 @@ def build_html(
     build_sha = (os.getenv("GITHUB_SHA", "") or "")[:7]
     run_id = os.getenv("GITHUB_RUN_ID", "")
 
+    # 出版商识别状态（简洁展示）
     pub_lines = []
     for name, pid in (pub_map or {}).items():
         pub_lines.append(f"{name} ✓" if pid else f"{name} ✗")
     pub_status = " / ".join(pub_lines) if pub_lines else "（未配置 preferred_publishers）"
 
-    def card(it: dict) -> str:
-        title = it.get("title", "")
-        abstract = it.get("abstract", "")
+    def safe_int(x, default=0):
+        try:
+            return int(x or 0)
+        except Exception:
+            return default
 
-        # ✅ 优先用 LLM 生成的科研简报；没有则回退规则摘要
-        brief_src = (it.get("brief_cn") or "").strip()
-        if not brief_src:
-            brief_src = human_brief_cn(title, abstract)
-        brief = brief_src.replace("\n", "<br>")
+    def tag_pill(text: str, tone: str = "neutral") -> str:
+        # tone: neutral / good / warn
+        bg = {"neutral": "#F3F4F6", "good": "#ECFDF3", "warn": "#FFF7ED"}.get(tone, "#F3F4F6")
+        fg = {"neutral": "#374151", "good": "#166534", "warn": "#9A3412"}.get(tone, "#374151")
+        bd = {"neutral": "#E5E7EB", "good": "#BBF7D0", "warn": "#FED7AA"}.get(tone, "#E5E7EB")
+        return f"""
+          <span style="
+            display:inline-block;
+            padding:2px 10px;
+            border-radius:999px;
+            border:1px solid {bd};
+            background:{bg};
+            color:{fg};
+            font-size:12px;
+            line-height:18px;
+            margin-right:6px;
+            white-space:nowrap;
+          ">{text}</span>
+        """
 
+    def source_badge(it: dict) -> str:
         bucket = it.get("bucket")
         if bucket == "reco_s2":
             via = it.get("via", "official_s2")
-            source_label = "S2猜你喜欢(ai4scholar)" if via == "ai4scholar" else "S2猜你喜欢(官方)"
-        elif bucket == "reco_oa":
-            source_label = "OpenAlex相关"
-        elif bucket == "pub_latest":
-            source_label = "出版商精选-最新"
-        elif bucket == "pub_classic":
-            source_label = "出版商精选-经典"
-        elif bucket == "graph_ref_classic":
-            source_label = "引用图谱-经典根论文"
-        elif bucket == "graph_citedby_keyfollow":
-            source_label = "引用图谱-关键后续"
-        elif bucket == "latest":
-            source_label = "最新"
-        elif bucket == "classic":
-            source_label = "经典"
-        else:
-            source_label = bucket or "未知来源"
+            return tag_pill("S2猜你喜欢 · AI4Scholar" if via == "ai4scholar" else "S2猜你喜欢 · 官方", "good")
+        if bucket == "reco_oa":
+            return tag_pill("OpenAlex · related_works", "neutral")
+        if bucket == "pub_latest":
+            return tag_pill("出版商精选 · 最新", "good")
+        if bucket == "pub_classic":
+            return tag_pill("出版商精选 · 经典", "good")
+        if bucket == "graph_ref_classic":
+            return tag_pill("引用图谱 · 根论文", "warn")
+        if bucket == "graph_citedby_keyfollow":
+            return tag_pill("引用图谱 · 关键后续", "warn")
+        if bucket == "latest":
+            return tag_pill("关键词 · 最新", "neutral")
+        if bucket == "classic":
+            return tag_pill("关键词 · 经典", "neutral")
+        return tag_pill(bucket or "未知来源", "neutral")
 
-        doi_url = it.get("url") or ""
-        pdf_url = it.get("pdf_url") or ""
-
-        pdf_btn = ""
-        if pdf_url:
-            pdf_btn = f"""
-              <a href="{pdf_url}" target="_blank" rel="noreferrer"
-                 style="display:inline-block;margin-left:8px;padding:2px 10px;border:1px solid #888;border-radius:999px;text-decoration:none;font-weight:600;">
-                PDF
-              </a>
-            """
-
-        venue = it.get("venue") or "Unknown venue"
+    def meta_line(it: dict) -> str:
+        venue = (it.get("venue") or "Unknown venue").strip()
         year = it.get("publication_year") or ""
-        cites = it.get("cited_by_count", 0) or 0
-        rel = it.get("relevance", 0) or 0
+        cites = safe_int(it.get("cited_by_count", 0))
+        rel = safe_int(it.get("relevance", 0))
+
+        # 质量提示：是否 DOAJ / 是否 publisher_hit
+        extra = []
+        if it.get("publisher_hit"):
+            extra.append(tag_pill("目标出版商", "good"))
+        if it.get("is_in_doaj"):
+            extra.append(tag_pill("DOAJ", "warn"))
+
+        extra_html = "".join(extra)
+        return f"""
+          <div style="margin-top:8px;color:#6B7280;font-size:13px;line-height:18px;">
+            <span>{venue}</span>
+            <span style="margin:0 6px;">·</span>
+            <span>{year}</span>
+            <span style="margin:0 6px;">·</span>
+            <span>引用 {cites}</span>
+            <span style="margin:0 6px;">·</span>
+            <span>relevance {rel}</span>
+            <span style="margin-left:10px;">{extra_html}</span>
+          </div>
+        """
+
+    def action_links(it: dict) -> str:
+        doi_url = (it.get("url") or "").strip()
+        pdf_url = (it.get("pdf_url") or "").strip()
+        oa_landing = (it.get("oa_landing") or "").strip()
+
+        # 主链接：doi_url；辅链接：PDF / Landing
+        links = []
+        if pdf_url:
+            links.append(f"""
+              <a href="{pdf_url}" target="_blank" rel="noreferrer" style="
+                display:inline-block;
+                padding:6px 10px;
+                border-radius:10px;
+                border:1px solid #E5E7EB;
+                background:#FFFFFF;
+                color:#111827;
+                text-decoration:none;
+                font-size:13px;
+                margin-right:8px;
+              ">PDF</a>
+            """)
+        if oa_landing and oa_landing != doi_url:
+            links.append(f"""
+              <a href="{oa_landing}" target="_blank" rel="noreferrer" style="
+                display:inline-block;
+                padding:6px 10px;
+                border-radius:10px;
+                border:1px solid #E5E7EB;
+                background:#FFFFFF;
+                color:#111827;
+                text-decoration:none;
+                font-size:13px;
+                margin-right:8px;
+              ">落地页</a>
+            """)
+        # 如果 doi_url 不是 doi，也可能是 landing；仍给“主链接”按钮
+        if doi_url:
+            links.append(f"""
+              <a href="{doi_url}" target="_blank" rel="noreferrer" style="
+                display:inline-block;
+                padding:6px 10px;
+                border-radius:10px;
+                border:1px solid #111827;
+                background:#111827;
+                color:#FFFFFF;
+                text-decoration:none;
+                font-size:13px;
+              ">打开</a>
+            """)
 
         return f"""
-        <div style="margin:14px 0;padding:12px;border:1px solid #ddd;border-radius:10px;">
-          <div style="font-size:16px;font-weight:700;">
-            <a href="{doi_url}" target="_blank" rel="noreferrer">{title}</a>
-            {pdf_btn}
+          <div style="margin-top:12px;">
+            {''.join(links) if links else ''}
           </div>
-          <div style="color:#555;margin-top:6px;">
-            {venue} · {year} · 引用 {cites} · relevance {rel} · 来源 {source_label} · 全文 {"PDF" if pdf_url else "无"}
+        """
+
+    def card(it: dict) -> str:
+        title = (it.get("title") or "").strip()
+        abstract = (it.get("abstract") or "").strip()
+
+        # ✅ 优先用 LLM 简报；没有则回退规则摘要
+        brief_src = (it.get("brief_cn") or "").strip()
+        if not brief_src:
+            brief_src = human_brief_cn(title, abstract)
+
+        # 轻度排版：把 “【】” 变成更像 Notion 的块
+        # 保留换行 -> <br>
+        brief_html = (
+            brief_src.replace("&", "&amp;")
+                     .replace("<", "&lt;")
+                     .replace(">", "&gt;")
+                     .replace("\n", "<br>")
+        )
+
+        doi_url = (it.get("url") or "").strip()
+        title_link = doi_url if doi_url else "#"
+
+        return f"""
+        <div style="
+          margin:12px 0;
+          padding:14px 16px;
+          border:1px solid #E5E7EB;
+          border-radius:14px;
+          background:#FFFFFF;
+          box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        ">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
+            <div style="min-width:0;">
+              <div style="margin-bottom:8px;">
+                {source_badge(it)}
+                {"<span style='display:inline-block;margin-left:6px;'></span>"}
+                {tag_pill("全文可得" if it.get("pdf_url") else "无全文", "good" if it.get("pdf_url") else "neutral")}
+              </div>
+
+              <div style="font-size:16px;font-weight:750;line-height:22px;color:#111827;">
+                <a href="{title_link}" target="_blank" rel="noreferrer" style="color:#111827;text-decoration:none;">
+                  {title if title else "（无标题）"}
+                </a>
+              </div>
+
+              {meta_line(it)}
+            </div>
           </div>
-          <div style="margin-top:10px;line-height:1.55;">{brief}</div>
+
+          <div style="
+            margin-top:12px;
+            padding:12px 12px;
+            border-radius:12px;
+            background:#F9FAFB;
+            color:#111827;
+            font-size:14px;
+            line-height:20px;
+          ">
+            {brief_html}
+          </div>
+
+          {action_links(it)}
         </div>
         """
 
-    def section(title: str, items: list[dict], empty_html: str) -> str:
-        return f"""
-        <h3>{title}</h3>
-        {''.join(card(x) for x in items) if items else empty_html}
+    def section(title: str, desc: str, items: list[dict], empty_text: str) -> str:
+        header = f"""
+          <div style="margin-top:18px;margin-bottom:6px;">
+            <div style="font-size:15px;font-weight:800;color:#111827;line-height:20px;">
+              {title}
+            </div>
+            <div style="margin-top:4px;color:#6B7280;font-size:13px;line-height:18px;">
+              {desc}
+            </div>
+          </div>
         """
+        body = "".join(card(x) for x in items) if items else f"""
+          <div style="
+            margin:10px 0 4px;
+            padding:12px 14px;
+            border:1px dashed #E5E7EB;
+            border-radius:14px;
+            color:#6B7280;
+            background:#FAFAFA;
+            font-size:13px;
+          ">{empty_text}</div>
+        """
+        return header + body
+
+    # 顶部信息栏（Notion-ish）
+    top_stats = [
+        tag_pill(f"推荐 {len(reco_s2) + len(reco_oa)}", "good"),
+        tag_pill(f"出版商精选 {len(pub_latest) + len(pub_classic)}", "good"),
+        tag_pill(f"图谱 {len(graph_ref_classic) + len(graph_citedby_keyfollow)}", "warn"),
+        tag_pill(f"最新 {len(latest)}", "neutral"),
+        tag_pill(f"经典 {len(classic)}", "neutral"),
+    ]
+    top_stats_html = "".join(top_stats)
 
     return f"""
-    <html><body style="font-family:Arial, Helvetica, sans-serif;">
-      <h2>{cfg['topic_cn']} — 每日科研简报（{date_str}）</h2>
-      <p style="color:#666;">
-        数据源：OpenAlex（works 搜索 / 引用图谱 / related_works）+ Semantic Scholar（或 ai4scholar）。<br>
-        出版商池：按 primary_location.source.host_organization 过滤（Publisher级），提升 IEEE/Elsevier/Springer/Wiley 覆盖。<br>
-        出版商识别：{pub_status}<br>
-        构建标识：sha={build_sha} run={run_id}
-      </p>
+    <html>
+    <body style="margin:0;padding:0;background:#F5F5F4;">
+      <div style="max-width:900px;margin:0 auto;padding:22px 14px;">
+        <div style="
+          padding:18px 18px;
+          border:1px solid #E7E5E4;
+          border-radius:16px;
+          background:#FFFFFF;
+          box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        ">
+          <div style="font-size:18px;font-weight:900;color:#111827;line-height:24px;">
+            {cfg['topic_cn']} · 每日科研简报
+          </div>
+          <div style="margin-top:6px;color:#6B7280;font-size:13px;line-height:18px;">
+            {date_str} · tz={cfg["timezone"]} · sha={build_sha} · run={run_id}
+          </div>
 
-      {section("⭐ S2猜你喜欢（更像“你可能也喜欢”）", reco_s2,
-               "<p>S2 今天没有产出（或被跳过），不影响其他内容。</p>")}
+          <div style="margin-top:12px;">
+            {top_stats_html}
+          </div>
 
-      {section("🧭 OpenAlex脉络（沿你的种子论文 related_works 扩展）", reco_oa,
-               "<p>OpenAlex related_works 今天为空：检查 seeds_positive.txt DOI 是否有效。</p>")}
+          <div style="margin-top:14px;color:#6B7280;font-size:12.5px;line-height:18px;">
+            <div>数据源：OpenAlex（检索/引用图谱/related_works） + Semantic Scholar（或 AI4Scholar 代理）。</div>
+            <div>出版商池：按 primary_location.source.host_organization 过滤，增强 IEEE / Elsevier / Springer / Wiley 覆盖。</div>
+            <div>出版商识别：{pub_status}</div>
+          </div>
+        </div>
 
-      {section("🏷️ 出版商精选-最新（IEEE / Elsevier / Springer / Wiley）", pub_latest,
-               "<p>出版商池“最新”今天为空：可能是 publisher 解析失败、或关键词过窄、或当天返回不足。</p>")}
+        <div style="margin-top:14px;"></div>
 
-      {section("🏷️ 出版商精选-经典（IEEE / Elsevier / Springer / Wiley）", pub_classic,
-               "<p>出版商池“经典”今天为空：可能是 publisher 解析失败、或 classic 条件过严、或引用阈值设置过高。</p>")}
+        {section(
+            "⭐ S2猜你喜欢",
+            "更偏“你可能也喜欢”：由种子论文 + 正/负例偏好驱动。",
+            reco_s2,
+            "今日没有产出（或被跳过/限流），不影响其它栏目。"
+        )}
 
-      {section("📚 引用图谱-经典根论文（references：更像“这方向的地基”）", graph_ref_classic,
-               "<p>引用图谱-根论文今天为空：可能是 seeds 数量不足、阈值过严（年限/最低引用），或图谱抓取失败。</p>")}
+        {section(
+            "🧭 OpenAlex 脉络扩展",
+            "沿种子论文 related_works 扩展：更像“同一簇文献”。",
+            reco_oa,
+            "今日为空：请检查 seeds_positive.txt 的 DOI 是否有效，或调大 max_related_per_seed。"
+        )}
 
-      {section("🛰️ 引用图谱-关键后续（cited-by：更像“重要延展/路线分叉”）", graph_citedby_keyfollow,
-               "<p>引用图谱-关键后续今天为空：可能是 follow_years 太短、最低引用过高，或 seeds 覆盖不足。</p>")}
+        {section(
+            "🏷️ 出版商精选 · 最新",
+            "只看目标出版商池（IEEE/Elsevier/Springer/Wiley）中的近期高价值工作。",
+            pub_latest,
+            "今日为空：可能 publisher 解析失败、关键词过窄、或当天返回不足。"
+        )}
 
-      {section(f"🆕 最新进展（全域，近 {cfg['latest_days']} 天）", latest,
-               "<p>今天未抓到足够匹配的最新条目。</p>")}
+        {section(
+            "🏷️ 出版商精选 · 经典",
+            "只看目标出版商池中的“高引用经典/基础工作”。",
+            pub_classic,
+            "今日为空：可能 classic 条件过严或引用阈值设置过高。"
+        )}
 
-      {section("🏛️ 经典/高影响力（全域，两年前及更早）", classic,
-               "<p>今天未抓到足够匹配的经典条目。</p>")}
+        {section(
+            "📚 引用图谱 · 经典根论文（references）",
+            "更像“地基/根论文/综述”：从 seeds 的参考文献向后追溯。",
+            graph_ref_classic,
+            "今日为空：可能 seeds 数量不足、年限/最低引用阈值过严、或引用图谱抓取失败。"
+        )}
 
-      <hr>
-      <p style="color:#888;font-size:12px;">
-        提示：引用图谱栏目强依赖 seeds 的质量；建议把你认可的“根论文/综述/标志性论文”逐步补充进 seeds_positive.txt。
-      </p>
-    </body></html>
+        {section(
+            "🛰️ 引用图谱 · 关键后续（cited-by）",
+            "更像“重要延展/路线分叉”：从 seeds 的被引文献向前追踪。",
+            graph_citedby_keyfollow,
+            "今日为空：可能 follow_years 太短、最低引用过高，或 seeds 覆盖不足。"
+        )}
+
+        {section(
+            f"🆕 最新进展（全域 · 近 {cfg['latest_days']} 天）",
+            "全域关键词检索：用于补齐图谱/出版商池没覆盖到的最新进展。",
+            latest,
+            "今日未抓到足够匹配的最新条目。"
+        )}
+
+        {section(
+            "🏛️ 经典/高影响力（全域）",
+            "全域关键词检索：用引用数主导补齐经典工作。",
+            classic,
+            "今日未抓到足够匹配的经典条目。"
+        )}
+
+        <div style="margin-top:16px;color:#9CA3AF;font-size:12px;line-height:18px;padding:0 2px;">
+          提示：引用图谱栏目高度依赖 seeds 的质量；建议持续把你认可的“根论文/综述/标志性论文”补进 seeds_positive.txt。
+        </div>
+      </div>
+    </body>
+    </html>
     """
-
 
 
 
