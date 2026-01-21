@@ -1725,6 +1725,43 @@ def main():
     cfg_raw = load_config()
     cfg = flatten_global_cfg(cfg_raw)
 
+
+    
+    # === DEBUG (safe) ===
+    dbg = (os.getenv("DEBUG", "") or "").strip()
+    if dbg:
+        oa_key = (os.getenv("OPENALEX_API_KEY") or "").strip()
+        oa_mailto = (os.getenv("OPENALEX_MAILTO") or "").strip()
+        s2_key = (os.getenv("S2_API_KEY") or "").strip()
+        ai4s_key = (os.getenv("AI4SCHOLAR_API_KEY") or "").strip()
+
+        print(f"[DEBUG] OPENALEX_API_KEY={mask_tail4(oa_key)}")
+        print(f"[DEBUG] OPENALEX_MAILTO={'(missing)' if not oa_mailto else oa_mailto}")
+        print(f"[DEBUG] S2_API_KEY={mask_tail4(s2_key)}")
+        print(f"[DEBUG] AI4SCHOLAR_API_KEY={mask_tail4(ai4s_key)}")
+
+        # （可选）用 /rate-limit 验证 OpenAlex key 真能用
+        # OpenAlex 文档：GET /rate-limit?api_key=...  [oai_citation:1‡docs.openalex.org](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication?utm_source=chatgpt.com)
+        try:
+            if oa_key:
+                data = http_request_json(
+                    "GET",
+                    "https://api.openalex.org/rate-limit",
+                    params=openalex_apply_auth({}, mailto=oa_mailto),
+                    timeout=20,
+                    retries=1,
+                    backoff_sec=1,
+                )
+                rl = (data or {}).get("rate_limit", {}) or {}
+                print(f"[DEBUG] OpenAlex credits_remaining={rl.get('credits_remaining')} "
+                      f"credits_limit={rl.get('credits_limit')} resets_in_seconds={rl.get('resets_in_seconds')}")
+            else:
+                print("[DEBUG] OpenAlex /rate-limit skipped (missing api key)")
+        except Exception as e:
+            print(f"[DEBUG] OpenAlex /rate-limit failed: {e}")
+
+
+    
     # Minimal required config
     if "timezone" not in cfg or "send_hour_local" not in cfg:
         raise RuntimeError("config.yml missing timezone or send_hour_local")
@@ -1877,6 +1914,16 @@ def main():
     print(f"seen saved: {len(seen)}")
     print("Email sent.")
 
+def mask_tail4(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return "(missing)"
+    # 只显示末4位，其余用 * 掩码
+    if len(s) <= 4:
+        return "*" * len(s)
+    return "*" * (len(s) - 4) + s[-4:]
+
+    
 
 if __name__ == "__main__":
     main()
