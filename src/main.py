@@ -1620,6 +1620,12 @@ def run_profile(global_cfg_flat: dict, profile: dict, mailto: str, seen: dict) -
         return None
 
     pos_path, neg_path = get_seed_paths(profile_cfg)
+    print(f"[{profile_cfg['topic_cn']}] cwd={Path.cwd()}")
+    print(f"[{profile_cfg['topic_cn']}] SCRIPT_DIR={SCRIPT_DIR}")
+    print(f"[{profile_cfg['topic_cn']}] pos_path={pos_path} exists={pos_path.exists()}")
+    print(f"[{profile_cfg['topic_cn']}] neg_path={neg_path} exists={neg_path.exists()}")
+    if pos_path.exists():
+        print(f"[{profile_cfg['topic_cn']}] pos_size={pos_path.stat().st_size}")
 
     # Build seed_query + conflict detection
     seed_works = fetch_seed_works_brief(mailto, pos_path, limit=int(profile_cfg.get("seeds_query_max_seeds", 10)))
