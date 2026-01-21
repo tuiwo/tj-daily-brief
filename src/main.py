@@ -1577,9 +1577,15 @@ def run_track(profile_cfg: dict, mailto: str, pub_id_set: set[str], pub_ids: lis
 
     latest_raw, classic_raw = fetch_latest_and_classic(profile_cfg, mailto)
 
+    if (os.getenv("DEBUG","") or "").strip():
+        print(f"[{profile_cfg.get('topic_cn')}] OpenAlex raw: latest={len(latest_raw)} classic={len(classic_raw)}")
+    
     latest_items = filter_seen(profile_cfg, dedupe(enrich(profile_cfg, latest_raw, "latest", publisher_id_set=pub_id_set)), seen)
     classic_items = filter_seen(profile_cfg, dedupe(enrich(profile_cfg, classic_raw, "classic", publisher_id_set=pub_id_set)), seen)
 
+    if (os.getenv("DEBUG","") or "").strip():
+        print(f"[{profile_cfg.get('topic_cn')}] after seen: latest_items={len(latest_items)} classic_items={len(classic_items)}")
+    
     latest = pick_top(profile_cfg, latest_items, int(profile_cfg.get("top_latest", 5)))
     classic = pick_top(profile_cfg, classic_items, int(profile_cfg.get("top_classic", 2)))
 

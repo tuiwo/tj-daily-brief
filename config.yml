@@ -148,7 +148,7 @@ profiles:
 
     query:
       mode: "explicit"   # 你也可以改成 auto，让 seeds 来带动 query
-      search_query: "sleep neuroscience EEG polysomnography sleep architecture NREM REM slow wave activity sleep spindles orexin hypocretin VLPO SCN circadian glymphatic memory consolidation"
+      search_query: "sleep neuroscience | polysomnography | sleep architecture | slow wave activity | sleep spindles | hypocretin | VLPO | SCN | circadian glymphatic | memory | consolidation"
       latest_days: 30
 
     keywords:
