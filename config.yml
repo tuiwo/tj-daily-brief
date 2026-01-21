@@ -1,99 +1,224 @@
-use_s2_recommendations: true
-s2_limit: 20          # 没 key 时建议 10~30，先保守
-s2_retries: 2         # 失败重试次数
-s2_backoff_sec: 5     # 重试退避秒数（指数退避的基数）
+# =========================
+# 全局设置（与具体领域无关）
+# =========================
+config_version: 2
 
-
-
-topic_cn: 功率半导体结温在线监测
 timezone: Asia/Shanghai
 send_hour_local: 23
 
-
-search_query: "junction temperature estimation online monitoring IGBT SiC power module"
-latest_days: 30
-
-top_latest: 5
-top_classic: 2
-top_reco: 5
-max_related_per_seed: 25
-
-
-top_reco_s2: 10
-top_reco_oa: 10
+# 去重窗口：同一篇论文在 N 天内不重复发
 seen_days_keep: 30
+
+# 偏向近几天（如果排序逻辑里用到了）
 prefer_recent_days: 180
 
+# OpenAlex：无需 key，但建议配置 OPENALEX_MAILTO 环境变量用于 polite pool
+openalex:
+  per_page: 200   # OpenAlex 单次 per_page 上限通常为 200（超过需分页）
 
+# 语义学者 / ai4scholar 推荐
+use_s2_recommendations: true
+s2:
+  limit: 20
+  retries: 2
+  backoff_sec: 5
 
+# LLM 简报（OpenRouter）
+llm:
+  use_llm_brief: true
+  openrouter_model: "xiaomi/mimo-v2-flash:free"
+  temperature: 0.2
+  max_tokens: 520
+  timeout_sec: 60
+  retries: 2
+  backoff_sec: 3
+  # 每天最多给多少篇生成 LLM 简报（控制成本）
+  max_items_per_run: 18
+  # 缓存
+  cache_file: "llm_cache.json"
 
-# --- 质量改造：出版商优先池 ---
-preferred_publishers:
-  - IEEE
-  - Elsevier
-  - Springer Nature
-  - Wiley
+# 冲突检测与兜底展示（跨领域关键词/seed 冲突时）
+conflict_detection:
+  enabled: true
+  # 用于判断“seed 与 query/keywords 是否偏离”的阈值（你代码里按相似度/覆盖率实现即可）
+  # 建议先保守：低一点更容易触发“双轨展示”
+  trigger_threshold: 0.18
+  # 触发后策略：dual_track = 仍然展示，但拆成两轨；warn_only = 只提示；skip_seed_track = 跳过种子驱动内容
+  on_conflict: "dual_track"
 
-# 你想在邮件里单独展示“出版商精选”吗
-enable_publisher_pools: true
+# seeds 自动生成 query（体验升级）
+seed_query_builder:
+  enabled: true
+  # 当 profile.search_query 为空或 profile.query.mode=auto 时启用
+  default_mode: "auto"   # auto | explicit
+  # 从 seeds 里抽取多少关键词/短语拼成 query（你实现时可按 title/abstract/keywords/概念抽取）
+  max_terms: 14
+  # 可选：生成 query 时的额外提示词（一般留空即可）
+  extra_hint: ""
 
-# 出版商池子里每天取多少条（建议：最新 6~10，经典 6~10）
-top_pub_latest: 8
-top_pub_classic: 8
+# =========================
+# 多主题 Profiles（每个主题一块）
+# 一封邮件会按 profile 分区展示
+# =========================
+profiles:
+  - id: "power_semiconductor_tj"
+    enabled: true
 
-# 出版商加分（越大越偏向四大）
-publisher_boost: 6
+    # 分区标题
+    title_cn: "功率半导体结温在线监测"
 
-# DOAJ 轻微降权（不做硬过滤，避免误伤）
-doaj_penalty: 2
+    # ✅ profile 路径：seeds 固定从该目录读取
+    #    profiles/power_tj/seeds_positive.txt
+    #    profiles/power_tj/seeds_negative.txt
+    path: "profiles/power_tj"
 
-# OpenAlex 每个查询拉多少条（建议 100~200）
-openalex_per_page: 200
+    # 搜索策略：explicit 用你写死的 query；auto 则从 seeds 自动生成
+    query:
+      mode: "explicit"   # explicit | auto
+      search_query: "junction temperature estimation online monitoring IGBT SiC power module"
+      latest_days: 30
 
+    keywords:
+      - "junction temperature"
+      - "Tj"
+      - "online"
+      - "real-time"
+      - "monitoring"
+      - "estimation"
+      - "TSEP"
+      - "temperature sensitive electrical parameter"
+      - "Vce(sat)"
+      - "Vf"
+      - "Rds(on)"
+      - "electro-thermal"
+      - "thermal impedance"
+      - "IGBT"
+      - "SiC"
+      - "MOSFET"
+      - "power module"
 
-# 引用图谱扩展（经典优先）
-graph_max_references_per_seed: 60
-graph_max_citedby_per_seed: 60
-graph_classic_years_ago: 5
-graph_min_cited_by: 30
-top_graph_classic: 10
+    exclude_keywords:
+      - "photovoltaic"
 
+    # 每个板块取多少条（该 profile 自己控制）
+    top:
+      latest: 5
+      classic: 2
+      reco_s2: 10
+      reco_oa: 10
+      pub_latest: 8
+      pub_classic: 8
+      graph_ref_classic: 10
+      graph_citedby_keyfollow: 10
 
-# --- LLM 简报（OpenRouter）---
-use_llm_brief: true
-openrouter_model: "xiaomi/mimo-v2-flash:free"   # 你可随时换成 anthropic/claude... 或其他
-llm_temperature: 0.2
-llm_max_tokens: 520
-llm_timeout_sec: 60
-llm_retries: 2
-llm_backoff_sec: 3
+    # related_works 推荐
+    related_works:
+      max_related_per_seed: 25
 
-# 每天最多给多少篇论文生成 LLM 简报（控制成本）
-llm_max_items_per_run: 18
+    # 出版商精选池（四大覆盖）
+    publishers:
+      enable_publisher_pools: true
+      preferred_publishers:
+        - IEEE
+        - Elsevier
+        - Springer Nature
+        - Wiley
+      # 加权参数（与你的 rank_score 对应）
+      publisher_boost: 6
+      doaj_penalty: 2
 
-# 缓存文件（建议保留）
-llm_cache_file: "llm_cache.json"
+    # 引用图谱分桶：根论文 vs 关键后续
+    graph:
+      max_references_per_seed: 60
+      max_citedby_per_seed: 60
 
+      # A) 根论文 / 经典（references）
+      ref_classic_years_ago: 5
+      ref_min_cited_by: 30
 
-keywords:
-  - "junction temperature"
-  - "Tj"
-  - "online"
-  - "real-time"
-  - "monitoring"
-  - "estimation"
-  - "TSEP"
-  - "temperature sensitive electrical parameter"
-  - "Vce(sat)"
-  - "Vf"
-  - "Rds(on)"
-  - "electro-thermal"
-  - "thermal impedance"
-  - "IGBT"
-  - "SiC"
-  - "MOSFET"
-  - "power module"
+      # B) 关键后续（cited-by）
+      follow_years: 3
+      follow_min_cited_by: 10
 
-exclude_keywords:
-  - "photovoltaic"
+  - id: "sleep"
+    enabled: true
 
+    title_cn: "睡眠论文周报"
+    path: "profiles/sleep"
+
+    query:
+      mode: "explicit"   # 你也可以改成 auto，让 seeds 来带动 query
+      search_query: "sleep neuroscience EEG polysomnography sleep architecture NREM REM slow wave activity sleep spindles orexin hypocretin VLPO SCN circadian glymphatic memory consolidation"
+      latest_days: 30
+
+    keywords:
+      - "sleep science"
+      - "sleep neuroscience"
+      - "sleep architecture"
+      - "sleep stages"
+      - "NREM"
+      - "REM"
+      - "slow-wave sleep"
+      - "slow-wave activity"
+      - "slow oscillation"
+      - "delta power"
+      - "sleep spindle"
+      - "K-complex"
+      - "arousal"
+      - "microarousal"
+      - "sleep homeostasis"
+      - "suprachiasmatic nucleus"
+      - "chronotype"
+      - "circadian misalignment"
+      - "polysomnography"
+      - "electroencephalography"
+      - "spectral analysis"
+      - "hypothalamus"
+      - "ventrolateral preoptic area"
+      - "orexin"
+      - "hypocretin"
+      - "locus coeruleus"
+      - "dorsal raphe"
+      - "thalamocortical"
+      - "REM-on"
+      - "REM-off"
+      - "memory consolidation"
+      - "hippocampus"
+      - "synaptic homeostasis"
+      - "glymphatic system"
+      - "CSF-ISF exchange"
+      - "metabolite clearance"
+
+    # ✅ 修复：原来这里是一个空的 "-" 会导致 YAML 解析失败
+    exclude_keywords: []
+
+    top:
+      latest: 2
+      classic: 2
+      reco_s2: 2
+      reco_oa: 2
+      pub_latest: 2
+      pub_classic: 2
+      graph_ref_classic: 2
+      graph_citedby_keyfollow: 2
+
+    related_works:
+      max_related_per_seed: 2
+
+    publishers:
+      enable_publisher_pools: true
+      preferred_publishers:
+        - IEEE
+        - Elsevier
+        - Springer Nature
+        - Wiley
+      publisher_boost: 6
+      doaj_penalty: 2
+
+    graph:
+      max_references_per_seed: 2
+      max_citedby_per_seed: 2
+      ref_classic_years_ago: 2
+      ref_min_cited_by: 2
+      follow_years: 2
+      follow_min_cited_by: 2
