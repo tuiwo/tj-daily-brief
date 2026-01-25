@@ -307,9 +307,15 @@ def openalex_get(params: dict, mailto: str = "", debug: Optional[dict] = None) -
         prepared = requests.Request("GET", "https://api.openalex.org/works", params=params).prepare()
         meta = data.get("meta") or {}
         results = data.get("results") or []
+        filter_str = params.get("filter", "") or ""
+        filter_has_type = "type:" in filter_str
+        filter_has_type_crossref = "type_crossref:" in filter_str
         print(f"[OA] kind={debug.get('kind','')} profile={debug.get('profile','')}")
         print(f"search_query={params.get('search','')}")
-        print(f"filter={params.get('filter','')}")
+        print(f"filter={filter_str}")
+        print(f"DEBUG OA filter_has_type={filter_has_type} filter_has_type_crossref={filter_has_type_crossref}")
+        if any(x in filter_str for x in ("type:journal-article", "type:proceedings-article", "type:posted-content")):
+            print("WARNING: OA filter uses type with crossref values; this likely yields 0 results")
         print(f"sort={params.get('sort','')} per_page={params.get('per_page','')}")
         print(f"FINAL_URL={prepared.url}")
         print(f"meta.count={meta.get('count')} results_len={len(results)}")
@@ -413,9 +419,8 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
     # classic cutoff: default 2 years ago (can be adjusted if you want)
     classic_to = (today - dt.timedelta(days=365 * 2)).isoformat()
 
-    common_filter = "type:journal-article|proceedings-article"
-    latest_filter = f"from_publication_date:{from_date},{common_filter}"
-    classic_filter = f"to_publication_date:{classic_to},{common_filter}"
+    latest_filter = f"from_publication_date:{from_date}"
+    classic_filter = f"to_publication_date:{classic_to}"
 
     per_page = clamp_int(profile_cfg.get("openalex_per_page", 200), OPENALEX_PER_PAGE_MIN, OPENALEX_PER_PAGE_MAX, 200)
     base = {"search": query, "per_page": per_page}
@@ -423,7 +428,7 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
         base["mailto"] = mailto
 
     if (os.getenv("DEBUG", "") or "").strip():
-        print(f"[{profile_cfg.get('topic_cn','')}] OA latest/classic params: from_date={from_date} classic_to={classic_to} common_filter={common_filter} query={query}")
+        print(f"[{profile_cfg.get('topic_cn','')}] OA latest/classic params: from_date={from_date} classic_to={classic_to} query={query}")
         print(f"[{profile_cfg.get('topic_cn','')}] OA latest filter: {latest_filter}")
         print(f"[{profile_cfg.get('topic_cn','')}] OA classic filter: {classic_filter}")
 
@@ -770,16 +775,14 @@ def fetch_publisher_pools(profile_cfg: dict, mailto: str, publisher_ids: list[st
     today = dt.date.today()
     from_date = (today - dt.timedelta(days=int(profile_cfg["latest_days"]))).isoformat()
     classic_to = (today - dt.timedelta(days=365 * 2)).isoformat()
-    common_filter = "type:journal-article|proceedings-article"
-
     per_page = clamp_int(profile_cfg.get("openalex_per_page", 200), OPENALEX_PER_PAGE_MIN, OPENALEX_PER_PAGE_MAX, 200)
     base = {"search": query, "per_page": per_page}
     if mailto:
         base["mailto"] = mailto
 
     pubs_or = "|".join(publisher_ids)
-    pub_latest_filter = f"from_publication_date:{from_date},primary_location.source.host_organization:{pubs_or},{common_filter}"
-    pub_classic_filter = f"to_publication_date:{classic_to},primary_location.source.host_organization:{pubs_or},{common_filter}"
+    pub_latest_filter = f"from_publication_date:{from_date},primary_location.source.host_organization:{pubs_or}"
+    pub_classic_filter = f"to_publication_date:{classic_to},primary_location.source.host_organization:{pubs_or}"
 
     if (os.getenv("DEBUG", "") or "").strip():
         print(f"[{profile_cfg.get('topic_cn','')}] OA publisher pools pubs_or={pubs_or}")
