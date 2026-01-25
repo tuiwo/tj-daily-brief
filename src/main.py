@@ -661,6 +661,21 @@ def pick_top_cited(items: list[dict], n: int) -> list[dict]:
     return sorted(items or [], key=lambda x: safe_int(x.get("cited_by_count", 0), 0), reverse=True)[:n]
 
 
+def merge_bucket(profile_cfg: dict, key: str, list_a: list[dict], list_b: list[dict]) -> list[dict]:
+    merged = dedupe((list_a or []) + (list_b or []))
+    top_map = {
+        "latest": "top_latest",
+        "classic": "top_classic",
+        "pub_latest": "top_pub_latest",
+        "pub_classic": "top_pub_classic",
+    }
+    top_key = top_map.get(key)
+    n = int(profile_cfg.get(top_key, 0)) if top_key else 0
+    if key in ("classic", "pub_classic"):
+        return pick_top_cited(merged, n)
+    return pick_top(profile_cfg, merged, n)
+
+
 # -------------------------
 # Publisher pools (OpenAlex publishers -> IDs cached)
 # -------------------------
@@ -1832,42 +1847,41 @@ def main():
                             background:#FFFBEB;color:#92400E;font-size:13px;line-height:18px;">
                   <b>⚠️ 主题冲突疑似：</b>
                   seeds 与本 profile 的关键词/查询不一致（avg_rel={r.conflict_meta.get('avg_rel'):.2f}, hit_ratio={r.conflict_meta.get('hit_ratio'):.2f}）。
-                  已启用双轨展示（Track A=profile query；Track B=seeds 自动 query）。
+                  已启用双轨合并展示（profile query + seeds 自动 query）。
                   <div style="margin-top:6px;"><b>Seed 自动 query:</b> {r.seed_query[:240] if r.seed_query else "（生成失败）"}</div>
                 </div>
                 """
             except Exception:
                 pass
 
+        merged_latest = r.track_a["latest"]
+        merged_classic = r.track_a["classic"]
+        merged_pub_latest = r.track_a["pub_latest"]
+        merged_pub_classic = r.track_a["pub_classic"]
+        if r.track_b:
+            merged_latest = merge_bucket(profile_cfg, "latest", r.track_a["latest"], r.track_b["latest"])
+            merged_classic = merge_bucket(profile_cfg, "classic", r.track_a["classic"], r.track_b["classic"])
+            merged_pub_latest = merge_bucket(profile_cfg, "pub_latest", r.track_a["pub_latest"], r.track_b["pub_latest"])
+            merged_pub_classic = merge_bucket(profile_cfg, "pub_classic", r.track_a["pub_classic"], r.track_b["pub_classic"])
+            print(f"[{profile_cfg['topic_cn']}] merge tracks: latest A={len(r.track_a['latest'])} B={len(r.track_b['latest'])} -> {len(merged_latest)}")
+            print(f"[{profile_cfg['topic_cn']}] merge tracks: classic A={len(r.track_a['classic'])} B={len(r.track_b['classic'])} -> {len(merged_classic)}")
+            print(f"[{profile_cfg['topic_cn']}] merge tracks: pub_latest A={len(r.track_a['pub_latest'])} B={len(r.track_b['pub_latest'])} -> {len(merged_pub_latest)}")
+            print(f"[{profile_cfg['topic_cn']}] merge tracks: pub_classic A={len(r.track_a['pub_classic'])} B={len(r.track_b['pub_classic'])} -> {len(merged_pub_classic)}")
+
         html_a = build_html(
             profile_cfg,
-            r.track_a["latest"], r.track_a["classic"],
+            merged_latest, merged_classic,
             r.seeds_side["reco_s2"], r.seeds_side["reco_oa"],
-            r.track_a["pub_latest"], r.track_a["pub_classic"],
+            merged_pub_latest, merged_pub_classic,
             r.pub_map,
             r.seeds_side["graph_ref_classic"], r.seeds_side["graph_citedby_keyfollow"]
         )
         body_a = strip_email_body(html_a)
 
-        body_b = ""
-        if r.track_b:
-            cfg_b = dict(profile_cfg)
-            cfg_b["topic_cn"] = f"{profile_cfg['topic_cn']}（Track B: Seeds 自动 Query）"
-            html_b = build_html(
-                cfg_b,
-                r.track_b["latest"], r.track_b["classic"],
-                [], [],
-                r.track_b["pub_latest"], r.track_b["pub_classic"],
-                r.pub_map,
-                [], []
-            )
-            body_b = strip_email_body(html_b)
-
         profile_block = f"""
         <div style="margin:0 0 18px 0;">
           <div style="max-width:900px;margin:0 auto;">{conflict_banner}</div>
           {body_a}
-          {body_b}
         </div>
         """
         all_profile_blocks.append(profile_block)
@@ -1875,11 +1889,9 @@ def main():
         # mark seen for displayed items
         mark_seen(
             seen, today_str,
-            r.track_a["latest"], r.track_a["classic"], r.track_a["pub_latest"], r.track_a["pub_classic"],
+            merged_latest, merged_classic, merged_pub_latest, merged_pub_classic,
             r.seeds_side["reco_s2"], r.seeds_side["reco_oa"], r.seeds_side["graph_ref_classic"], r.seeds_side["graph_citedby_keyfollow"],
         )
-        if r.track_b:
-            mark_seen(seen, today_str, r.track_b["latest"], r.track_b["classic"], r.track_b["pub_latest"], r.track_b["pub_classic"])
 
     merged_body = "\n".join(all_profile_blocks)
     date_str = now_local(cfg["timezone"]).strftime("%Y-%m-%d (%a)")
@@ -1899,7 +1911,7 @@ def main():
             {date_str} · tz={cfg["timezone"]} · sha={build_sha} · run={run_id} · topics={len(results)}
           </div>
           <div style="margin-top:10px;color:#6B7280;font-size:12.5px;line-height:18px;">
-            本邮件按 profiles 分区汇总。若某主题触发冲突检测，将展示 Track A/Track B 两套检索结果作为兜底。
+            本邮件按 profiles 分区汇总。若某主题触发冲突检测，将合并 profile query 与 seeds 自动 query 的结果展示。
           </div>
         </div>
 
