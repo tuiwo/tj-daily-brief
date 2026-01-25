@@ -6,6 +6,7 @@ import smtplib
 import random
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import html as html_lib
 import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,14 @@ OPENALEX_FILTER_OR_MAX = 100
 POLITE_SLEEP_SEC = 0.12
 
 BAD_OPENALEX_IDS_FILE = "data/bad_openalex_ids.txt"
+
+RUN_STATS = {
+    "openalex_requests": 0,
+    "openalex_failures": 0,
+    "openrouter_requests": 0,
+    "openrouter_failures": 0,
+    "openrouter_parse_errors": 0,
+}
 
 
 # -------------------------
@@ -72,6 +81,20 @@ def should_send_now(cfg: dict) -> bool:
     if dbg:
         print(f"DEBUG tz={cfg['timezone']} now={now.isoformat()} hour={now.hour} send_hour_local={cfg['send_hour_local']}")
     return now.hour == int(cfg["send_hour_local"])
+
+
+def validate_config(cfg_raw: dict, cfg_flat: dict) -> None:
+    errors = []
+    if not cfg_flat.get("use_llm_brief", False):
+        errors.append("llm.use_llm_brief must be true (LLM-only output required).")
+    if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
+        errors.append("Missing OPENROUTER_API_KEY (required for LLM-only output).")
+    if not (os.getenv("OPENALEX_API_KEY") or "").strip():
+        errors.append("Missing OPENALEX_API_KEY (recommended; OpenAlex requires API key).")
+    if not (os.getenv("S2_API_KEY") or "").strip():
+        print("[WARN] S2_API_KEY missing: S2 enhancements disabled.")
+    if errors:
+        raise RuntimeError("Config validation failed: " + " | ".join(errors))
 
 
 # -------------------------
@@ -390,7 +413,10 @@ def reconstruct_abstract(inv_idx):
 
 def openalex_get(params: dict, mailto: str = "", debug: Optional[dict] = None) -> dict:
     params = openalex_apply_auth(params, mailto=mailto)
+    RUN_STATS["openalex_requests"] += 1
     data = http_request_json("GET", "https://api.openalex.org/works", params=params, timeout=60, retries=3, backoff_sec=3)
+    if not data:
+        RUN_STATS["openalex_failures"] += 1
     if (os.getenv("DEBUG", "") or "").strip() and debug:
         prepared = requests.Request("GET", "https://api.openalex.org/works", params=params).prepare()
         meta = data.get("meta") or {}
@@ -425,8 +451,10 @@ def openalex_get_work_by_id(openalex_id: str, mailto: str = "") -> Optional[dict
     params = openalex_apply_auth({}, mailto=mailto)
 
     try:
+        RUN_STATS["openalex_requests"] += 1
         data = http_request_json("GET", url, params=params, timeout=60, retries=2, backoff_sec=2)
         if not data:
+            RUN_STATS["openalex_failures"] += 1
             if work_id not in BAD_OPENALEX_IDS:
                 BAD_OPENALEX_IDS.add(work_id)
                 mark_bad_openalex_id(work_id)
@@ -1317,6 +1345,31 @@ def attach_fulltext_links(profile_cfg: dict, items: list[dict]) -> list[dict]:
 LLM_STATUS_READY = "ready"
 LLM_STATUS_PENDING = "pending_llm"
 LLM_STATUS_FAILED = "failed_llm"
+
+LLM_JSON_SCHEMA = {
+    "name": "brief_schema",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title_cn": {"type": "string"},
+            "one_liner": {"type": "string"},
+            "why_relevant": {"type": "string"},
+            "key_takeaways": {"type": "array", "items": {"type": "string"}},
+            "caveats": {"type": "string"},
+            "recommended_action": {"type": "string"},
+        },
+        "required": [
+            "title_cn",
+            "one_liner",
+            "why_relevant",
+            "key_takeaways",
+            "caveats",
+            "recommended_action",
+        ],
+    },
+}
 def openrouter_headers() -> Optional[dict]:
     key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
     if not key:
@@ -1331,10 +1384,16 @@ def openrouter_headers() -> Optional[dict]:
     return h
 
 
+class LlmError(RuntimeError):
+    def __init__(self, error_type: str, message: str):
+        super().__init__(message)
+        self.error_type = error_type
+
+
 def openrouter_chat_json(profile_cfg: dict, messages: list[dict]) -> dict:
     headers = openrouter_headers()
     if not headers:
-        raise RuntimeError("OPENROUTER_API_KEY missing")
+        raise LlmError("missing_key", "OPENROUTER_API_KEY missing")
 
     url = "https://openrouter.ai/api/v1/chat/completions"
     payload = {
@@ -1343,6 +1402,8 @@ def openrouter_chat_json(profile_cfg: dict, messages: list[dict]) -> dict:
         "temperature": float(profile_cfg.get("llm_temperature", 0.2)),
         "max_tokens": int(profile_cfg.get("llm_max_tokens", 520)),
         "stream": False,
+        "response_format": {"type": "json_schema", "json_schema": LLM_JSON_SCHEMA},
+        "plugins": [{"id": "response-healing"}],
     }
 
     retries = int(profile_cfg.get("llm_retries", 2))
@@ -1351,6 +1412,7 @@ def openrouter_chat_json(profile_cfg: dict, messages: list[dict]) -> dict:
 
     for attempt in range(retries + 1):
         try:
+            RUN_STATS["openrouter_requests"] += 1
             r = requests.request("POST", url, headers=headers, data=json.dumps(payload), timeout=timeout)
             status = r.status_code
             if status == 429 or status == 408 or (500 <= status < 600):
@@ -1361,24 +1423,31 @@ def openrouter_chat_json(profile_cfg: dict, messages: list[dict]) -> dict:
                     time.sleep(sleep_s)
                     continue
             if status >= 400:
-                raise RuntimeError(f"OpenRouter status={status} body={r.text[:240]}")
+                RUN_STATS["openrouter_failures"] += 1
+                if status == 429:
+                    raise LlmError("rate_limited", f"OpenRouter status={status}")
+                if 400 <= status < 500:
+                    raise LlmError("http_4xx", f"OpenRouter status={status}")
+                raise LlmError("http_5xx", f"OpenRouter status={status}")
             data = r.json()
             content = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content", "").strip()
             return parse_llm_json(content)
         except requests.RequestException as e:
+            RUN_STATS["openrouter_failures"] += 1
             if attempt < retries:
                 sleep_s = _http_backoff_seconds(backoff, attempt)
                 print(f"OpenRouter exception: {e}; retry in {sleep_s:.1f}s")
                 time.sleep(sleep_s)
                 continue
-            raise
+            raise LlmError("timeout", str(e))
         except ValueError as e:
+            RUN_STATS["openrouter_parse_errors"] += 1
             if attempt < retries:
                 sleep_s = _http_backoff_seconds(backoff, attempt)
                 print(f"OpenRouter parse error: {e}; retry in {sleep_s:.1f}s")
                 time.sleep(sleep_s)
                 continue
-            raise
+            raise LlmError("parse_error", str(e))
 
 
 def load_llm_cache(path: str) -> dict:
@@ -1420,8 +1489,13 @@ def parse_llm_json(content: str) -> dict:
         data = json.loads(raw[start:end + 1])
     if not isinstance(data, dict):
         raise ValueError("llm output not dict")
-    required = ["one_liner", "method_clues", "metrics", "recommendation"]
+    required = ["title_cn", "one_liner", "why_relevant", "key_takeaways", "caveats", "recommended_action"]
     for k in required:
+        if k == "key_takeaways":
+            v = data.get(k)
+            if not isinstance(v, list) or not v:
+                raise ValueError("llm json missing field: key_takeaways")
+            continue
         v = (data.get(k) or "").strip() if isinstance(data.get(k), str) else ""
         if not v:
             raise ValueError(f"llm json missing field: {k}")
@@ -1433,16 +1507,21 @@ def format_llm_brief(brief: dict) -> str:
         return ""
     parts = []
     mapping = [
+        ("标题", "title_cn"),
         ("一句话", "one_liner"),
-        ("做了什么", "method_clues"),
-        ("结果/指标", "metrics"),
-        ("建议", "recommendation"),
-        ("注意/局限", "limitations"),
+        ("为何相关", "why_relevant"),
+        ("建议", "recommended_action"),
+        ("注意", "caveats"),
     ]
     for label, key in mapping:
         val = (brief.get(key) or "").strip() if isinstance(brief.get(key), str) else ""
         if val:
             parts.append(f"{label}：{val}")
+    takeaways = brief.get("key_takeaways")
+    if isinstance(takeaways, list) and takeaways:
+        joined = "；".join(str(x).strip() for x in takeaways if str(x).strip())
+        if joined:
+            parts.append(f"要点：{joined}")
     return "\n".join(parts)
 
 
@@ -1463,7 +1542,7 @@ def build_llm_prompt_cn(it: dict, prompt_version: str) -> list[dict]:
 
     sys = (
         "你是我的研究助理。"
-        "请只基于我提供的论文元数据与摘要，生成“中文科研简报”。"
+        "请只基于我提供的论文元数据与摘要，生成中文科研简报。"
         "严禁编造论文中不存在的实验、指标、结论。"
         "若摘要信息不足，请明确写“信息不足/需读全文”。"
         "输出必须是严格 JSON，不要包含任何额外文本或 Markdown。"
@@ -1472,19 +1551,20 @@ def build_llm_prompt_cn(it: dict, prompt_version: str) -> list[dict]:
     user = f"""请为下列论文生成中文科研简报，输出严格 JSON，格式固定为：
 
 {{
-  "paper_type": "...",
+  "title_cn": "...",
   "one_liner": "...",
-  "method_clues": "...",
-  "metrics": "...",
-  "recommendation": "...",
-  "limitations": "..."
+  "why_relevant": "...",
+  "key_takeaways": ["...", "..."],
+  "caveats": "...",
+  "recommended_action": "..."
 }}
 
 说明：
-- paper_type: 综述/方法/实验/系统/理论/数据集/其他
-- metrics: 若无数值请写“摘要未提供/需看全文”
-- recommendation: 给出工程/研究上的可用性建议
-- limitations: 如信息不足需说明
+- title_cn: 中文标题（可简化）
+- why_relevant: 与主题/工程链路的相关性
+- key_takeaways: 2-4 条要点
+- caveats: 需注意的限制或信息不足
+- recommended_action: 该论文值得如何处理（阅读/复现/收藏/忽略）
 
 元数据：
 - 标题：{title}
@@ -1548,6 +1628,7 @@ def pending_record(profile_cfg: dict, it: dict, reason: str, retry_count: int = 
         "last_attempt": today,
         "last_error": reason,
         "retry_count": retry_count,
+        "error_type": reason,
         "prompt_version": profile_cfg.get("llm_prompt_version", ""),
         "model": profile_cfg.get("openrouter_model", ""),
     }
@@ -1588,6 +1669,8 @@ def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
             if not k:
                 continue
             items_by_key[k] = it
+    if (os.getenv("STRICT_MODE", "") or "").strip().lower() in ("1", "true", "yes"):
+        max_n = max(max_n, len(items_by_key))
 
     if not global_cfg_flat.get("use_llm_brief", False) or not openrouter_headers():
         reason = "llm_disabled_or_missing_key"
@@ -1595,6 +1678,7 @@ def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
         for k, it in items_by_key.items():
             it["llm_status"] = LLM_STATUS_PENDING
             it["llm_failure_reason"] = reason
+            it["llm_failure_type"] = reason
             pending[k] = pending_record(global_cfg_flat, it, reason, retry_count=pending.get(k, {}).get("retry_count", 0))
             stats["pending"] += 1
         save_pending_store(pending, pending_path)
@@ -1635,23 +1719,26 @@ def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
             continue
         it["llm_status"] = LLM_STATUS_PENDING
         it["llm_failure_reason"] = "deferred_for_next_run"
+        it["llm_failure_type"] = "deferred_for_next_run"
         prev = pending.get(k, {})
         pending[k] = pending_record(global_cfg_flat, it, "deferred_for_next_run", retry_count=prev.get("retry_count", 0))
         stats["pending"] += 1
 
-    def worker(k: str, it: dict) -> tuple[str, Optional[dict], Optional[str]]:
+    def worker(k: str, it: dict) -> tuple[str, Optional[dict], Optional[str], Optional[str]]:
         try:
             brief = llm_brief_cn(global_cfg_flat, it)
-            return k, brief, None
+            return k, brief, None, None
+        except LlmError as e:
+            return k, None, e.error_type, str(e)
         except Exception as e:
-            return k, None, str(e)
+            return k, None, "unknown_error", str(e)
 
     futures = []
     with ThreadPoolExecutor(max_workers=max_concurrency) as ex:
         for k, it, _ in queue:
             futures.append(ex.submit(worker, k, it))
         for idx, fut in enumerate(as_completed(futures), 1):
-            k, brief, err = fut.result()
+            k, brief, err_type, err_msg = fut.result()
             it = items_by_key.get(k)
             if brief:
                 cache[k] = brief
@@ -1665,28 +1752,32 @@ def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
             else:
                 if it is not None:
                     it["llm_status"] = LLM_STATUS_PENDING
-                    it["llm_failure_reason"] = err or "llm_failed"
+                    it["llm_failure_reason"] = err_msg or "llm_failed"
+                    it["llm_failure_type"] = err_type or "llm_failed"
                 prev = pending.get(k, {})
                 retry_count = int(prev.get("retry_count", 0)) + 1
-                pending[k] = pending_record(global_cfg_flat, it or prev.get("item") or {}, err or "llm_failed", retry_count=retry_count)
+                pending[k] = pending_record(global_cfg_flat, it or prev.get("item") or {}, err_type or "llm_failed", retry_count=retry_count)
                 stats["pending"] += 1
                 ident = item_identity(it or {})
-                print(f"LLM briefs: failed key={k[:32]} id={ident} err={err} retry={retry_count}")
+                print(f"LLM briefs: failed key={k[:32]} id={ident} type={err_type} err={err_msg} retry={retry_count}")
 
     save_llm_cache(cache, cache_path)
     save_pending_store(pending, pending_path)
     return stats
 
 
-def filter_ready_items(items: list[dict]) -> Tuple[list[dict], int]:
-    ready = []
-    pending = 0
+def summarize_llm_items(items: list[dict]) -> tuple[int, int, dict]:
+    ready = 0
+    failed = 0
+    reasons: dict[str, int] = {}
     for it in items or []:
         if it.get("llm_status") == LLM_STATUS_READY and it.get("llm_brief"):
-            ready.append(it)
+            ready += 1
         else:
-            pending += 1
-    return ready, pending
+            failed += 1
+            reason = it.get("llm_failure_type") or it.get("llm_failure_reason") or "unknown"
+            reasons[reason] = reasons.get(reason, 0) + 1
+    return ready, failed, reasons
 
 
 # -------------------------
@@ -1904,7 +1995,34 @@ def build_html(
         title = (it.get("title") or "").strip()
         brief_src = format_llm_brief(it.get("llm_brief"))
         if not brief_src:
-            return ""
+            reason = (it.get("llm_failure_type") or it.get("llm_failure_reason") or "unknown").strip()
+            venue = (it.get("venue") or "Unknown venue").strip()
+            year = it.get("publication_year") or ""
+            doi = (it.get("doi") or "").strip()
+            url = (it.get("url") or "").strip()
+            abstract = (it.get("abstract") or "").strip()
+            snippet = (abstract[:220] + "…") if len(abstract) > 220 else abstract
+            info = html_lib.escape(snippet or "（无摘要）")
+            title_html = html_lib.escape(title if title else "（无标题）")
+            return f"""
+            <div style="margin:12px 0;padding:14px 16px;border:1px dashed #FCA5A5;border-radius:14px;background:#FEF2F2;">
+              <div style="font-size:14px;font-weight:700;color:#991B1B;">LLM 生成失败（原因：{html_lib.escape(reason)}）</div>
+              <div style="margin-top:6px;font-size:14px;color:#111827;">{title_html}</div>
+              <div style="margin-top:6px;color:#6B7280;font-size:13px;">
+                <span>{html_lib.escape(venue)}</span>
+                <span style="margin:0 6px;">·</span>
+                <span>{year}</span>
+              </div>
+              <div style="margin-top:8px;color:#374151;font-size:13px;line-height:18px;">{info}</div>
+              <div style="margin-top:8px;color:#6B7280;font-size:12px;">
+                <span>{html_lib.escape(doi) if doi else ""}</span>
+                <span style="margin:0 6px;">·</span>
+                <a href="{html_lib.escape(url) if url else '#'}" target="_blank" rel="noreferrer" style="color:#6B7280;text-decoration:none;">
+                  {html_lib.escape(url) if url else "无链接"}
+                </a>
+              </div>
+            </div>
+            """
 
         brief_html = (
             brief_src.replace("&", "&amp;")
@@ -2131,9 +2249,15 @@ def run_profile(global_cfg_flat: dict, profile: dict, mailto: str, seen: dict) -
     print(f"[{profile_cfg['topic_cn']}] neg_path={neg_path} exists={neg_path.exists()}")
     if pos_path.exists():
         print(f"[{profile_cfg['topic_cn']}] pos_size={pos_path.stat().st_size}")
+    else:
+        print(f"[WARN] [{profile_cfg['topic_cn']}] seeds_positive.txt missing; fallback to profile query.")
+    if not neg_path.exists():
+        print(f"[WARN] [{profile_cfg['topic_cn']}] seeds_negative.txt missing; negative filter disabled.")
 
     # Build seed_query + conflict detection
     seed_works = fetch_seed_works_brief(mailto, pos_path, limit=int(profile_cfg.get("seeds_query_max_seeds", 10)))
+    if not seed_works:
+        print(f"[WARN] [{profile_cfg['topic_cn']}] seeds_positive empty; seeds-based query disabled.")
     seed_query = build_seed_query_from_works(seed_works, max_terms=int(profile_cfg.get("seeds_query_max_terms", 12)))
 
     if not (profile_cfg.get("search_query") or "").strip():
@@ -2236,40 +2360,17 @@ def main():
     cfg_raw = load_config()
     cfg = flatten_global_cfg(cfg_raw)
 
+    validate_config(cfg_raw, cfg)
 
     
     # === DEBUG (safe) ===
     dbg = (os.getenv("DEBUG", "") or "").strip()
     if dbg:
-        oa_key = (os.getenv("OPENALEX_API_KEY") or "").strip()
         oa_mailto = (os.getenv("OPENALEX_MAILTO") or "").strip()
-        s2_key = (os.getenv("S2_API_KEY") or "").strip()
-        ai4s_key = (os.getenv("AI4SCHOLAR_API_KEY") or "").strip()
-
-        print(f"[DEBUG] OPENALEX_API_KEY={mask_tail4(oa_key)}")
+        print(f"[DEBUG] OPENALEX_API_KEY={'set' if (os.getenv('OPENALEX_API_KEY') or '').strip() else 'missing'}")
         print(f"[DEBUG] OPENALEX_MAILTO={'(missing)' if not oa_mailto else oa_mailto}")
-        print(f"[DEBUG] S2_API_KEY={mask_tail4(s2_key)}")
-        print(f"[DEBUG] AI4SCHOLAR_API_KEY={mask_tail4(ai4s_key)}")
-
-        # （可选）用 /rate-limit 验证 OpenAlex key 真能用
-        # OpenAlex 文档：GET /rate-limit?api_key=...  [oai_citation:1‡docs.openalex.org](https://docs.openalex.org/how-to-use-the-api/rate-limits-and-authentication?utm_source=chatgpt.com)
-        try:
-            if oa_key:
-                data = http_request_json(
-                    "GET",
-                    "https://api.openalex.org/rate-limit",
-                    params=openalex_apply_auth({}, mailto=oa_mailto),
-                    timeout=20,
-                    retries=1,
-                    backoff_sec=1,
-                )
-                rl = (data or {}).get("rate_limit", {}) or {}
-                print(f"[DEBUG] OpenAlex credits_remaining={rl.get('credits_remaining')} "
-                      f"credits_limit={rl.get('credits_limit')} resets_in_seconds={rl.get('resets_in_seconds')}")
-            else:
-                print("[DEBUG] OpenAlex /rate-limit skipped (missing api key)")
-        except Exception as e:
-            print(f"[DEBUG] OpenAlex /rate-limit failed: {e}")
+        print(f"[DEBUG] S2_API_KEY={'set' if (os.getenv('S2_API_KEY') or '').strip() else 'missing'}")
+        print(f"[DEBUG] AI4SCHOLAR_API_KEY={'set' if (os.getenv('AI4SCHOLAR_API_KEY') or '').strip() else 'missing'}")
 
 
     
@@ -2322,9 +2423,13 @@ def main():
     # 2) Apply LLM briefs BEFORE rendering HTML
     apply_llm_briefs(cfg, all_lists_for_llm)
 
+    strict_mode = (os.getenv("STRICT_MODE", "") or "").strip().lower() in ("1", "true", "yes")
+
     # 3) Render HTML blocks + mark seen
     all_profile_blocks = []
     pending_total = 0
+    profile_summaries = []
+    total_reasons: dict[str, int] = {}
     for r in results:
         profile_cfg = r.profile_cfg
 
@@ -2357,30 +2462,36 @@ def main():
             print(f"[{profile_cfg['topic_cn']}] merge tracks: pub_latest A={len(r.track_a['pub_latest'])} B={len(r.track_b['pub_latest'])} -> {len(merged_pub_latest)}")
             print(f"[{profile_cfg['topic_cn']}] merge tracks: pub_classic A={len(r.track_a['pub_classic'])} B={len(r.track_b['pub_classic'])} -> {len(merged_pub_classic)}")
 
-        merged_latest, p = filter_ready_items(merged_latest)
-        pending_total += p
-        merged_classic, p = filter_ready_items(merged_classic)
-        pending_total += p
-        merged_pub_latest, p = filter_ready_items(merged_pub_latest)
-        pending_total += p
-        merged_pub_classic, p = filter_ready_items(merged_pub_classic)
-        pending_total += p
-        reco_s2_ready, p = filter_ready_items(r.seeds_side["reco_s2"])
-        pending_total += p
-        reco_oa_ready, p = filter_ready_items(r.seeds_side["reco_oa"])
-        pending_total += p
-        graph_ref_ready, p = filter_ready_items(r.seeds_side["graph_ref_classic"])
-        pending_total += p
-        graph_cited_ready, p = filter_ready_items(r.seeds_side["graph_citedby_keyfollow"])
-        pending_total += p
+        lists_for_stats = [
+            merged_latest, merged_classic, merged_pub_latest, merged_pub_classic,
+            r.seeds_side["reco_s2"], r.seeds_side["reco_oa"],
+            r.seeds_side["graph_ref_classic"], r.seeds_side["graph_citedby_keyfollow"],
+        ]
+        profile_ready = 0
+        profile_failed = 0
+        profile_reasons: dict[str, int] = {}
+        for lst in lists_for_stats:
+            ready, failed, reasons = summarize_llm_items(lst)
+            profile_ready += ready
+            profile_failed += failed
+            for k, v in reasons.items():
+                profile_reasons[k] = profile_reasons.get(k, 0) + v
+                total_reasons[k] = total_reasons.get(k, 0) + v
+        pending_total += profile_failed
+        profile_summaries.append({
+            "profile": profile_cfg.get("topic_cn") or "",
+            "ready": profile_ready,
+            "failed": profile_failed,
+            "reasons": profile_reasons,
+        })
 
         html_a = build_html(
             profile_cfg,
             merged_latest, merged_classic,
-            reco_s2_ready, reco_oa_ready,
+            r.seeds_side["reco_s2"], r.seeds_side["reco_oa"],
             merged_pub_latest, merged_pub_classic,
             r.pub_map,
-            graph_ref_ready, graph_cited_ready
+            r.seeds_side["graph_ref_classic"], r.seeds_side["graph_citedby_keyfollow"]
         )
         body_a = strip_email_body(html_a)
 
@@ -2396,13 +2507,38 @@ def main():
         mark_seen(
             seen, today_str,
             merged_latest, merged_classic, merged_pub_latest, merged_pub_classic,
-            reco_s2_ready, reco_oa_ready, graph_ref_ready, graph_cited_ready,
+            r.seeds_side["reco_s2"], r.seeds_side["reco_oa"], r.seeds_side["graph_ref_classic"], r.seeds_side["graph_citedby_keyfollow"],
         )
 
     merged_body = "\n".join(all_profile_blocks)
     date_str = now_local(cfg["timezone"]).strftime("%Y-%m-%d (%a)")
     build_sha = (os.getenv("GITHUB_SHA", "") or "")[:7]
     run_id = os.getenv("GITHUB_RUN_ID", "")
+
+    if strict_mode and pending_total > 0:
+        print(f"[STRICT] LLM failures detected: failed={pending_total}; exiting with code 2.")
+        for ps in profile_summaries:
+            print(f"[STRICT] profile={ps['profile']} ready={ps['ready']} failed={ps['failed']} reasons={ps['reasons']}")
+        raise SystemExit(2)
+
+    summary_lines = [f"profiles={len(results)} ready={sum(p['ready'] for p in profile_summaries)} failed={pending_total}"]
+    if total_reasons:
+        summary_lines.append("reasons=" + ", ".join(f"{k}:{v}" for k, v in total_reasons.items()))
+    summary_lines.append(
+        f"openalex_req={RUN_STATS['openalex_requests']} openalex_fail={RUN_STATS['openalex_failures']} "
+        f"openrouter_req={RUN_STATS['openrouter_requests']} openrouter_fail={RUN_STATS['openrouter_failures']} "
+        f"parse_err={RUN_STATS['openrouter_parse_errors']}"
+    )
+    run_summary = " | ".join(summary_lines)
+    print(f"[SUMMARY] {run_summary}")
+    for ps in profile_summaries:
+        print(f"[SUMMARY] profile={ps['profile']} ready={ps['ready']} failed={ps['failed']} reasons={ps['reasons']}")
+
+    summary_html = f"""
+      <div style="margin-top:10px;color:#6B7280;font-size:12.5px;line-height:18px;">
+        <div><b>本期摘要：</b>{run_summary}</div>
+      </div>
+    """
 
     merged_html = f"""
     <html>
@@ -2419,6 +2555,7 @@ def main():
           <div style="margin-top:10px;color:#6B7280;font-size:12.5px;line-height:18px;">
             本邮件按 profiles 分区汇总。若某主题触发冲突检测，将合并 profile query 与 seeds 自动 query 的结果展示。
           </div>
+          {summary_html}
         </div>
 
         <div style="margin-top:14px;"></div>
