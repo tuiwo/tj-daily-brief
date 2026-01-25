@@ -1473,16 +1473,15 @@ def build_html(
         """
 
     def section(title: str, desc: str, items: list[dict], empty_text: str) -> str:
+        if not items:
+            return ""
         header = f"""
           <div style="margin-top:18px;margin-bottom:6px;">
             <div style="font-size:15px;font-weight:800;color:#111827;line-height:20px;">{title}</div>
             <div style="margin-top:4px;color:#6B7280;font-size:13px;line-height:18px;">{desc}</div>
           </div>
         """
-        body = "".join(card(x) for x in items) if items else f"""
-          <div style="margin:10px 0 4px;padding:12px 14px;border:1px dashed #E5E7EB;border-radius:14px;color:#6B7280;
-                      background:#FAFAFA;font-size:13px;">{empty_text}</div>
-        """
+        body = "".join(card(x) for x in items)
         return header + body
 
     top_stats = [
@@ -1493,31 +1492,20 @@ def build_html(
         tag_pill(f"经典 {len(classic)}", "neutral"),
     ]
     top_stats_html = "".join(top_stats)
+    all_count = (
+        len(latest) + len(classic) + len(reco_s2) + len(reco_oa) +
+        len(pub_latest) + len(pub_classic) + len(graph_ref_classic) + len(graph_citedby_keyfollow)
+    )
+    empty_profile_block = """
+      <div style="margin:12px 0 4px;padding:12px 14px;border:1px dashed #E5E7EB;border-radius:14px;color:#6B7280;
+                  background:#FAFAFA;font-size:13px;">
+        今日为空：没有抓到任何匹配论文。建议检查 seeds_positive.txt / search_query / keywords / latest_days 等配置。
+      </div>
+    """
 
-    return f"""
-    <html>
-    <body style="margin:0;padding:0;background:#F5F5F4;">
-      <div style="max-width:900px;margin:0 auto;padding:22px 14px;">
-        <div style="padding:18px 18px;border:1px solid #E7E5E4;border-radius:16px;background:#FFFFFF;
-                    box-shadow:0 1px 2px rgba(0,0,0,0.04);">
-          <div style="font-size:18px;font-weight:900;color:#111827;line-height:24px;">
-            {profile_cfg['topic_cn']} · 每日科研简报
-          </div>
-          <div style="margin-top:6px;color:#6B7280;font-size:13px;line-height:18px;">
-            {date_str} · tz={profile_cfg["timezone"]} · sha={build_sha} · run={run_id}
-          </div>
-
-          <div style="margin-top:12px;">{top_stats_html}</div>
-
-          <div style="margin-top:14px;color:#6B7280;font-size:12.5px;line-height:18px;">
-            <div>数据源：OpenAlex（检索/引用图谱/related_works） + Semantic Scholar（或 AI4Scholar 代理）。</div>
-            <div>出版商池：按 primary_location.source.host_organization 过滤，增强 IEEE / Elsevier / Springer / Wiley 覆盖。</div>
-            <div>出版商识别：{pub_status}</div>
-          </div>
-        </div>
-
-        <div style="margin-top:14px;"></div>
-
+    sections_html = ""
+    if all_count > 0:
+        sections_html = f"""
         {section("⭐ S2猜你喜欢","更偏“你可能也喜欢”：由种子论文 + 正/负例偏好驱动。",
                  reco_s2,"今日没有产出（或被跳过/限流），不影响其它栏目。")}
 
@@ -1546,6 +1534,34 @@ def build_html(
         <div style="margin-top:16px;color:#9CA3AF;font-size:12px;line-height:18px;padding:0 2px;">
           提示：引用图谱栏目高度依赖 seeds 的质量；建议持续把你认可的“根论文/综述/标志性论文”补进 seeds_positive.txt。
         </div>
+        """
+
+    return f"""
+    <html>
+    <body style="margin:0;padding:0;background:#F5F5F4;">
+      <div style="max-width:900px;margin:0 auto;padding:22px 14px;">
+        <div style="padding:18px 18px;border:1px solid #E7E5E4;border-radius:16px;background:#FFFFFF;
+                    box-shadow:0 1px 2px rgba(0,0,0,0.04);">
+          <div style="font-size:18px;font-weight:900;color:#111827;line-height:24px;">
+            {profile_cfg['topic_cn']} · 每日科研简报
+          </div>
+          <div style="margin-top:6px;color:#6B7280;font-size:13px;line-height:18px;">
+            {date_str} · tz={profile_cfg["timezone"]} · sha={build_sha} · run={run_id}
+          </div>
+
+          <div style="margin-top:12px;">{top_stats_html}</div>
+
+          <div style="margin-top:14px;color:#6B7280;font-size:12.5px;line-height:18px;">
+            <div>数据源：OpenAlex（检索/引用图谱/related_works） + Semantic Scholar（或 AI4Scholar 代理）。</div>
+            <div>出版商池：按 primary_location.source.host_organization 过滤，增强 IEEE / Elsevier / Springer / Wiley 覆盖。</div>
+            <div>出版商识别：{pub_status}</div>
+          </div>
+        </div>
+
+        <div style="margin-top:14px;"></div>
+
+        {empty_profile_block if all_count == 0 else ""}
+        {sections_html}
       </div>
     </body>
     </html>
