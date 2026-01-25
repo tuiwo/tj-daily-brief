@@ -4,7 +4,7 @@
 config_version: 2
 
 timezone: Asia/Shanghai
-send_hour_local: 23
+send_hour_local: 18
 
 # 去重窗口：同一篇论文在 N 天内不重复发
 seen_days_keep: 30
@@ -26,7 +26,7 @@ s2:
 # LLM 简报（OpenRouter）
 llm:
   use_llm_brief: true
-  openrouter_model: "xiaomi/mimo-v2-flash:free"
+  openrouter_model: "google/gemini-2.5-flash-lite"
   temperature: 0.2
   max_tokens: 520
   timeout_sec: 60
