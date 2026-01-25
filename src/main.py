@@ -252,6 +252,8 @@ def http_request_json(
                 r.raise_for_status()
 
             r.raise_for_status()
+            if (os.getenv("DEBUG", "") or "").strip():
+                print(f"[HTTP] {method} {r.request.url} status={r.status_code}")
             return r.json()
 
         except Exception as e:
@@ -298,9 +300,20 @@ def reconstruct_abstract(inv_idx):
             pos2word[p] = word
     return " ".join(pos2word[i] for i in sorted(pos2word))
 
-def openalex_get(params: dict, mailto: str = "") -> dict:
+def openalex_get(params: dict, mailto: str = "", debug: Optional[dict] = None) -> dict:
     params = openalex_apply_auth(params, mailto=mailto)
-    return http_request_json("GET", "https://api.openalex.org/works", params=params, timeout=60, retries=3, backoff_sec=3)
+    data = http_request_json("GET", "https://api.openalex.org/works", params=params, timeout=60, retries=3, backoff_sec=3)
+    if (os.getenv("DEBUG", "") or "").strip() and debug:
+        prepared = requests.Request("GET", "https://api.openalex.org/works", params=params).prepare()
+        meta = data.get("meta") or {}
+        results = data.get("results") or []
+        print(f"[OA] kind={debug.get('kind','')} profile={debug.get('profile','')}")
+        print(f"search_query={params.get('search','')}")
+        print(f"filter={params.get('filter','')}")
+        print(f"sort={params.get('sort','')} per_page={params.get('per_page','')}")
+        print(f"FINAL_URL={prepared.url}")
+        print(f"meta.count={meta.get('count')} results_len={len(results)}")
+    return data
 
 
 def openalex_get_work_by_id(openalex_id: str, mailto: str = "") -> Optional[dict]:
@@ -401,23 +414,54 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
     classic_to = (today - dt.timedelta(days=365 * 2)).isoformat()
 
     common_filter = "type:journal-article|proceedings-article"
+    latest_filter = f"from_publication_date:{from_date},{common_filter}"
+    classic_filter = f"to_publication_date:{classic_to},{common_filter}"
 
     per_page = clamp_int(profile_cfg.get("openalex_per_page", 200), OPENALEX_PER_PAGE_MIN, OPENALEX_PER_PAGE_MAX, 200)
     base = {"search": query, "per_page": per_page}
     if mailto:
         base["mailto"] = mailto
 
-    latest = openalex_get({
-        **base,
-        "filter": f"from_publication_date:{from_date},{common_filter}",
-        "sort": "publication_date:desc",
-    } ,mailto=mailto).get("results", [])
+    if (os.getenv("DEBUG", "") or "").strip():
+        print(f"[{profile_cfg.get('topic_cn','')}] OA latest/classic params: from_date={from_date} classic_to={classic_to} common_filter={common_filter} query={query}")
+        print(f"[{profile_cfg.get('topic_cn','')}] OA latest filter: {latest_filter}")
+        print(f"[{profile_cfg.get('topic_cn','')}] OA classic filter: {classic_filter}")
 
-    classic = openalex_get({
+    latest_data = openalex_get({
         **base,
-        "filter": f"to_publication_date:{classic_to},{common_filter}",
+        "filter": latest_filter,
+        "sort": "publication_date:desc",
+    } ,mailto=mailto, debug={"kind": "latest", "profile": profile_cfg.get("topic_cn","")})
+    latest = latest_data.get("results", [])
+    if (os.getenv("DEBUG", "") or "").strip() and len(latest) == 0:
+        openalex_get(
+            {"search": query, "per_page": 1},
+            mailto=mailto,
+            debug={"kind": "latest_probe_search", "profile": profile_cfg.get("topic_cn","")},
+        )
+        openalex_get(
+            {"filter": latest_filter, "per_page": 1},
+            mailto=mailto,
+            debug={"kind": "latest_probe_filter", "profile": profile_cfg.get("topic_cn","")},
+        )
+
+    classic_data = openalex_get({
+        **base,
+        "filter": classic_filter,
         "sort": "cited_by_count:desc",
-    },mailto=mailto).get("results", [])
+    },mailto=mailto, debug={"kind": "classic", "profile": profile_cfg.get("topic_cn","")})
+    classic = classic_data.get("results", [])
+    if (os.getenv("DEBUG", "") or "").strip() and len(classic) == 0:
+        openalex_get(
+            {"search": query, "per_page": 1},
+            mailto=mailto,
+            debug={"kind": "classic_probe_search", "profile": profile_cfg.get("topic_cn","")},
+        )
+        openalex_get(
+            {"filter": classic_filter, "per_page": 1},
+            mailto=mailto,
+            debug={"kind": "classic_probe_filter", "profile": profile_cfg.get("topic_cn","")},
+        )
 
     return latest, classic
 
@@ -734,18 +778,49 @@ def fetch_publisher_pools(profile_cfg: dict, mailto: str, publisher_ids: list[st
         base["mailto"] = mailto
 
     pubs_or = "|".join(publisher_ids)
+    pub_latest_filter = f"from_publication_date:{from_date},primary_location.source.host_organization:{pubs_or},{common_filter}"
+    pub_classic_filter = f"to_publication_date:{classic_to},primary_location.source.host_organization:{pubs_or},{common_filter}"
 
-    pub_latest = openalex_get({
-        **base,
-        "filter": f"from_publication_date:{from_date},primary_location.source.host_organization:{pubs_or},{common_filter}",
-        "sort": "cited_by_count:desc",
-    }, mailto=mailto).get("results", [])
+    if (os.getenv("DEBUG", "") or "").strip():
+        print(f"[{profile_cfg.get('topic_cn','')}] OA publisher pools pubs_or={pubs_or}")
+        print(f"[{profile_cfg.get('topic_cn','')}] OA pub_latest filter: {pub_latest_filter}")
+        print(f"[{profile_cfg.get('topic_cn','')}] OA pub_classic filter: {pub_classic_filter}")
 
-    pub_classic = openalex_get({
+    pub_latest_data = openalex_get({
         **base,
-        "filter": f"to_publication_date:{classic_to},primary_location.source.host_organization:{pubs_or},{common_filter}",
+        "filter": pub_latest_filter,
         "sort": "cited_by_count:desc",
-    }, mailto=mailto).get("results", [])
+    }, mailto=mailto, debug={"kind": "pub_latest", "profile": profile_cfg.get("topic_cn","")})
+    pub_latest = pub_latest_data.get("results", [])
+    if (os.getenv("DEBUG", "") or "").strip() and len(pub_latest) == 0:
+        openalex_get(
+            {"search": query, "per_page": 1},
+            mailto=mailto,
+            debug={"kind": "pub_latest_probe_search", "profile": profile_cfg.get("topic_cn","")},
+        )
+        openalex_get(
+            {"filter": pub_latest_filter, "per_page": 1},
+            mailto=mailto,
+            debug={"kind": "pub_latest_probe_filter", "profile": profile_cfg.get("topic_cn","")},
+        )
+
+    pub_classic_data = openalex_get({
+        **base,
+        "filter": pub_classic_filter,
+        "sort": "cited_by_count:desc",
+    }, mailto=mailto, debug={"kind": "pub_classic", "profile": profile_cfg.get("topic_cn","")})
+    pub_classic = pub_classic_data.get("results", [])
+    if (os.getenv("DEBUG", "") or "").strip() and len(pub_classic) == 0:
+        openalex_get(
+            {"search": query, "per_page": 1},
+            mailto=mailto,
+            debug={"kind": "pub_classic_probe_search", "profile": profile_cfg.get("topic_cn","")},
+        )
+        openalex_get(
+            {"filter": pub_classic_filter, "per_page": 1},
+            mailto=mailto,
+            debug={"kind": "pub_classic_probe_filter", "profile": profile_cfg.get("topic_cn","")},
+        )
 
     return pub_latest, pub_classic
 
