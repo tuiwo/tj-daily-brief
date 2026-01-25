@@ -3,6 +3,8 @@ import re
 import time
 import json
 import smtplib
+import random
+import sys
 import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
@@ -227,6 +229,36 @@ def get_seed_paths(profile_cfg: dict) -> Tuple[Path, Path]:
 # -------------------------
 # HTTP helper (GET/POST JSON with retry)
 # -------------------------
+def _http_should_retry(status: int) -> bool:
+    if status in (400, 401, 403, 404):
+        return False
+    if status in (408, 429):
+        return True
+    return 500 <= status < 600
+
+
+def _http_retry_after_seconds(headers: dict) -> Optional[int]:
+    ra = (headers or {}).get("Retry-After") or (headers or {}).get("retry-after")
+    if not ra:
+        return None
+    try:
+        return int(ra)
+    except Exception:
+        return None
+
+
+def _http_backoff_seconds(backoff_sec: int, attempt: int, retry_after: Optional[int] = None) -> float:
+    base = retry_after if retry_after is not None else backoff_sec * (2 ** attempt)
+    jitter = random.uniform(0.0, max(0.1, base * 0.1))
+    return base + jitter
+
+
+def _extract_work_id_from_url(url: str) -> str:
+    if "/works/" not in url:
+        return ""
+    return url.split("/works/")[-1].split("?")[0]
+
+
 def http_request_json(
     method: str,
     url: str,
@@ -243,10 +275,19 @@ def http_request_json(
         try:
             r = requests.request(method, url, params=params, headers=headers, data=data, timeout=timeout)
 
-            if r.status_code in retry_on_status or (500 <= r.status_code < 600):
+            status = r.status_code
+            if status in (400, 401, 403, 404):
+                if status == 404:
+                    req_url = r.request.url
+                    work_id = _extract_work_id_from_url(req_url)
+                    print(f"[HTTP] 404 Not Found url={req_url} work_id={work_id} status=404")
+                return {}
+
+            if _http_should_retry(status) or status in retry_on_status:
                 if attempt < retries:
-                    sleep_s = backoff_sec * (2 ** attempt)
-                    print(f"{method} {url} retryable status={r.status_code}; retry in {sleep_s}s")
+                    retry_after = _http_retry_after_seconds(r.headers) if status == 429 else None
+                    sleep_s = _http_backoff_seconds(backoff_sec, attempt, retry_after=retry_after)
+                    print(f"{method} {url} retryable status={status}; retry in {sleep_s:.1f}s")
                     time.sleep(sleep_s)
                     continue
                 r.raise_for_status()
@@ -256,13 +297,23 @@ def http_request_json(
                 print(f"[HTTP] {method} {r.request.url} status={r.status_code}")
             return r.json()
 
-        except Exception as e:
+        except requests.RequestException as e:
             if attempt < retries:
-                sleep_s = backoff_sec * (2 ** attempt)
-                print(f"{method} {url} exception: {e}; retry in {sleep_s}s")
+                sleep_s = _http_backoff_seconds(backoff_sec, attempt)
+                print(f"{method} {url} exception: {e}; retry in {sleep_s:.1f}s")
                 time.sleep(sleep_s)
                 continue
             raise
+
+
+def selftest_http_retry():
+    assert _http_should_retry(404) is False
+    assert _http_should_retry(500) is True
+    assert _http_should_retry(429) is True
+    assert _http_retry_after_seconds({"Retry-After": "3"}) == 3
+    sleep_s = _http_backoff_seconds(2, 0, retry_after=5)
+    assert sleep_s >= 5
+    print("http retry selftest ok")
 
 # -------------------------
 # OpenAlex auth helpers (api_key + mailto)
@@ -335,7 +386,8 @@ def openalex_get_work_by_id(openalex_id: str, mailto: str = "") -> Optional[dict
     params = openalex_apply_auth({}, mailto=mailto)
 
     try:
-        return http_request_json("GET", url, params=params, timeout=60, retries=2, backoff_sec=2)
+        data = http_request_json("GET", url, params=params, timeout=60, retries=2, backoff_sec=2)
+        return data or None
     except requests.HTTPError as e:
         if "404" in str(e):
             return None
@@ -411,16 +463,14 @@ def fetch_works_by_openalex_ids(ids: list[str], mailto: str = "", per_page: int 
 
 
 def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict], list[dict]]:
-    query = profile_cfg.get("search_query") or " ".join((profile_cfg.get("keywords") or [])[:6])
+    raw_query = profile_cfg.get("search_query") or " ".join((profile_cfg.get("keywords") or [])[:6])
+    cleaned_query, kept_tokens = clean_search_query(raw_query)
+    query = cleaned_query or raw_query
 
     today = dt.date.today()
-    from_date = (today - dt.timedelta(days=int(profile_cfg["latest_days"]))).isoformat()
 
     # classic cutoff: default 2 years ago (can be adjusted if you want)
     classic_to = (today - dt.timedelta(days=365 * 2)).isoformat()
-
-    latest_filter = f"from_publication_date:{from_date}"
-    classic_filter = f"to_publication_date:{classic_to}"
 
     per_page = clamp_int(profile_cfg.get("openalex_per_page", 200), OPENALEX_PER_PAGE_MIN, OPENALEX_PER_PAGE_MAX, 200)
     base = {"search": query, "per_page": per_page}
@@ -428,27 +478,98 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
         base["mailto"] = mailto
 
     if (os.getenv("DEBUG", "") or "").strip():
-        print(f"[{profile_cfg.get('topic_cn','')}] OA latest/classic params: from_date={from_date} classic_to={classic_to} query={query}")
-        print(f"[{profile_cfg.get('topic_cn','')}] OA latest filter: {latest_filter}")
-        print(f"[{profile_cfg.get('topic_cn','')}] OA classic filter: {classic_filter}")
+        print(f"[DEBUG] raw_query={raw_query} cleaned_query={cleaned_query} kept_tokens={len(kept_tokens)}")
 
-    latest_data = openalex_get({
-        **base,
-        "filter": latest_filter,
-        "sort": "publication_date:desc",
-    } ,mailto=mailto, debug={"kind": "latest", "profile": profile_cfg.get("topic_cn","")})
-    latest = latest_data.get("results", [])
-    if (os.getenv("DEBUG", "") or "").strip() and len(latest) == 0:
-        openalex_get(
-            {"search": query, "per_page": 1},
-            mailto=mailto,
-            debug={"kind": "latest_probe_search", "profile": profile_cfg.get("topic_cn","")},
-        )
-        openalex_get(
+    windows = [int(profile_cfg.get("latest_days", 30)), 90, 180, 365]
+    seen_windows = set()
+    windows = [w for w in windows if not (w in seen_windows or seen_windows.add(w))]
+
+    latest = []
+    latest_filter = ""
+    latest_data = {}
+    for i, days in enumerate(windows):
+        from_date = (today - dt.timedelta(days=int(days))).isoformat()
+        latest_filter = f"from_publication_date:{from_date}"
+        if (os.getenv("DEBUG", "") or "").strip():
+            print(f"[{profile_cfg.get('topic_cn','')}] OA latest params: from_date={from_date} query={query}")
+            print(f"[{profile_cfg.get('topic_cn','')}] OA latest filter: {latest_filter}")
+        latest_data = openalex_get({
+            **base,
+            "filter": latest_filter,
+            "sort": "publication_date:desc",
+        } ,mailto=mailto, debug={"kind": "latest", "profile": profile_cfg.get("topic_cn","")})
+        latest = latest_data.get("results", [])
+        meta = latest_data.get("meta") or {}
+        if len(latest) == 0:
+            print(f"[OA] latest_backoff window_days={days} meta.count={meta.get('count')} results_len={len(latest)}")
+        if len(latest) > 0:
+            break
+        if i == 0 and (os.getenv("DEBUG", "") or "").strip():
+            openalex_get(
+                {"search": query, "per_page": 1},
+                mailto=mailto,
+                debug={"kind": "latest_probe_search", "profile": profile_cfg.get("topic_cn","")},
+            )
+            openalex_get(
+                {"filter": latest_filter, "per_page": 1},
+                mailto=mailto,
+                debug={"kind": "latest_probe_filter", "profile": profile_cfg.get("topic_cn","")},
+            )
+
+    if len(latest) == 0:
+        probe_data = openalex_get(
             {"filter": latest_filter, "per_page": 1},
             mailto=mailto,
-            debug={"kind": "latest_probe_filter", "profile": profile_cfg.get("topic_cn","")},
+            debug={"kind": "latest_probe_filter_final", "profile": profile_cfg.get("topic_cn","")},
         )
+        probe_meta = probe_data.get("meta") or {}
+        if safe_int(probe_meta.get("count", 0), 0) > 0 and kept_tokens:
+            no_search_data = openalex_get(
+                {"filter": latest_filter, "sort": "publication_date:desc", "per_page": 200},
+                mailto=mailto,
+                debug={"kind": "latest_fallback_no_search", "profile": profile_cfg.get("topic_cn","")},
+            )
+            fallback_works = no_search_data.get("results", []) or []
+            fetched = len(fallback_works)
+            qset = set(kept_tokens)
+            scored = []
+            for w in fallback_works:
+                title = w.get("title") or ""
+                abstract = reconstruct_abstract(w.get("abstract_inverted_index")) or (w.get("abstract") or "")
+                title_overlap = len(set(tokenize_en(title)) & qset)
+                abstract_overlap = len(set(tokenize_en(abstract)) & qset)
+                score = 2 * title_overlap + abstract_overlap
+                scored.append((score, w))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            kept = [w for score, w in scored if score >= 2]
+            if not kept:
+                top = scored[:10]
+                max_score = top[0][0] if top else 0
+                if max_score == 0:
+                    print(f"[OA] latest_fallback_no_search fetched={fetched} kept=0 reason=no_overlap")
+                    latest = []
+                else:
+                    latest = [w for _, w in top]
+                    print(f"[OA] latest_fallback_no_search fetched={fetched} kept={len(latest)} mode=topk_low_score")
+            else:
+                latest = kept
+                print(f"[OA] latest_fallback_no_search fetched={fetched} kept={len(latest)}")
+
+            if scored:
+                examples = []
+                for score, w in scored[:3]:
+                    examples.append(f"({score}, {w.get('title','')[:60]}, {w.get('publication_date')})")
+                print(f"[OA] latest_fallback_top examples: {', '.join(examples)}")
+        else:
+            if not kept_tokens:
+                print("[OA] latest_fallback_no_search skipped: empty cleaned_query tokens")
+            else:
+                print(f"[OA] latest_fallback_no_search skipped: meta.count={probe_meta.get('count')}")
+
+    classic_filter = f"to_publication_date:{classic_to}"
+    if (os.getenv("DEBUG", "") or "").strip():
+        print(f"[{profile_cfg.get('topic_cn','')}] OA classic params: classic_to={classic_to} query={query}")
+        print(f"[{profile_cfg.get('topic_cn','')}] OA classic filter: {classic_filter}")
 
     classic_data = openalex_get({
         **base,
@@ -770,7 +891,9 @@ def fetch_publisher_pools(profile_cfg: dict, mailto: str, publisher_ids: list[st
     if not publisher_ids:
         return [], []
 
-    query = profile_cfg.get("search_query") or " ".join((profile_cfg.get("keywords") or [])[:6])
+    raw_query = profile_cfg.get("search_query") or " ".join((profile_cfg.get("keywords") or [])[:6])
+    cleaned_query, _ = clean_search_query(raw_query)
+    query = cleaned_query or raw_query
 
     today = dt.date.today()
     from_date = (today - dt.timedelta(days=int(profile_cfg["latest_days"]))).isoformat()
@@ -1325,6 +1448,10 @@ STOPWORDS = {
     "method","methods","analysis","results","model","models","system","systems","paper",
     "approach","approaches","review","reviews","application","applications",
 }
+QUERY_STOPWORDS = STOPWORDS | {
+    "this","that","have","has","had","without","within","including","include","including",
+    "components","component","design","designs","performance","using","use","based",
+}
 
 def tokenize_en(text: str) -> list[str]:
     text = (text or "").lower()
@@ -1337,6 +1464,25 @@ def tokenize_en(text: str) -> list[str]:
             continue
         out.append(t)
     return out
+
+
+def clean_search_query(raw: str, max_tokens: int = 12) -> Tuple[str, list[str]]:
+    raw = (raw or "").strip()
+    tokens = re.findall(r"[a-z][a-z0-9\-]{1,}", raw.lower())
+    kept: list[str] = []
+    seen = set()
+    for t in tokens:
+        if len(t) <= 2:
+            continue
+        if t in QUERY_STOPWORDS:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        kept.append(t)
+        if len(kept) >= max_tokens:
+            break
+    return " ".join(kept), kept
 
 def build_seed_query_from_works(seed_works: list[dict], max_terms: int = 12) -> str:
     freq: dict[str, int] = {}
@@ -2040,4 +2186,7 @@ def mask_tail4(s: str) -> str:
     
 
 if __name__ == "__main__":
+    if "--selftest-http" in sys.argv:
+        selftest_http_retry()
+        raise SystemExit(0)
     main()
