@@ -5,6 +5,7 @@ import json
 import smtplib
 import random
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,8 @@ OPENALEX_FILTER_OR_MAX = 100
 
 # Polite throttling (avoid 429)
 POLITE_SLEEP_SEC = 0.12
+
+BAD_OPENALEX_IDS_FILE = "data/bad_openalex_ids.txt"
 
 
 # -------------------------
@@ -112,6 +115,11 @@ def flatten_global_cfg(cfg: dict) -> dict:
     out["llm_backoff_sec"] = safe_int(deep_get(cfg, "llm.backoff_sec", 3), 3)
     out["llm_max_items_per_run"] = safe_int(deep_get(cfg, "llm.max_items_per_run", 18), 18)
     out["llm_cache_file"] = deep_get(cfg, "llm.cache_file", "llm_cache.json")
+    out["llm_max_concurrency"] = safe_int(deep_get(cfg, "llm.max_concurrency", 4), 4)
+    out["llm_pending_store"] = deep_get(cfg, "llm.pending_store", "data/pending_llm.json")
+    out["llm_pending_max_retries"] = safe_int(deep_get(cfg, "llm.pending_max_retries", 5), 5)
+    out["llm_pending_max_days"] = safe_int(deep_get(cfg, "llm.pending_max_days", 7), 7)
+    out["llm_prompt_version"] = deep_get(cfg, "llm.prompt_version", "brief_v3_2026-01-25")
 
     # Misc
     out["seen_days_keep"] = safe_int(cfg.get("seen_days_keep", 30), 30)
@@ -206,6 +214,11 @@ def flatten_profile_cfg(global_cfg_flat: dict, profile: dict) -> dict:
         out["llm_backoff_sec"] = safe_int(pllm.get("backoff_sec", out["llm_backoff_sec"]), out["llm_backoff_sec"])
         out["llm_max_items_per_run"] = safe_int(pllm.get("max_items_per_run", out["llm_max_items_per_run"]), out["llm_max_items_per_run"])
         out["llm_cache_file"] = pllm.get("cache_file", out["llm_cache_file"])
+        out["llm_max_concurrency"] = safe_int(pllm.get("max_concurrency", out["llm_max_concurrency"]), out["llm_max_concurrency"])
+        out["llm_pending_store"] = pllm.get("pending_store", out["llm_pending_store"])
+        out["llm_pending_max_retries"] = safe_int(pllm.get("pending_max_retries", out["llm_pending_max_retries"]), out["llm_pending_max_retries"])
+        out["llm_pending_max_days"] = safe_int(pllm.get("pending_max_days", out["llm_pending_max_days"]), out["llm_pending_max_days"])
+        out["llm_prompt_version"] = pllm.get("prompt_version", out["llm_prompt_version"])
 
     return out
 
@@ -339,6 +352,30 @@ def openalex_apply_auth(params: Optional[dict] = None, mailto: str = "") -> dict
     if mailto and "mailto" not in out:
         out["mailto"] = mailto
     return out
+
+
+def load_bad_openalex_ids(path: str = BAD_OPENALEX_IDS_FILE) -> set[str]:
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return set(line.strip() for line in f if line.strip())
+    except Exception:
+        return set()
+
+
+def mark_bad_openalex_id(work_id: str, path: str = BAD_OPENALEX_IDS_FILE) -> None:
+    if not work_id:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(work_id + "\n")
+    except Exception:
+        return
+
+
+BAD_OPENALEX_IDS = load_bad_openalex_ids()
 # -------------------------
 # OpenAlex helpers
 # -------------------------
@@ -381,13 +418,20 @@ def openalex_get_work_by_id(openalex_id: str, mailto: str = "") -> Optional[dict
         work_id = oid.split("/")[-1]
     else:
         work_id = oid
+    if work_id in BAD_OPENALEX_IDS:
+        return None
     url = f"https://api.openalex.org/works/{work_id}"
 
     params = openalex_apply_auth({}, mailto=mailto)
 
     try:
         data = http_request_json("GET", url, params=params, timeout=60, retries=2, backoff_sec=2)
-        return data or None
+        if not data:
+            if work_id not in BAD_OPENALEX_IDS:
+                BAD_OPENALEX_IDS.add(work_id)
+                mark_bad_openalex_id(work_id)
+            return None
+        return data
     except requests.HTTPError as e:
         if "404" in str(e):
             return None
@@ -708,6 +752,7 @@ def enrich(profile_cfg: dict, works: list[dict], bucket: str = "", publisher_id_
         is_in_doaj = bool(src.get("is_in_doaj", False))
 
         out.append({
+            "work_id": w.get("id") or "",
             "title": title,
             "abstract": abstract,
             "publication_year": w.get("publication_year"),
@@ -722,6 +767,7 @@ def enrich(profile_cfg: dict, works: list[dict], bucket: str = "", publisher_id_
             "is_in_doaj": is_in_doaj,
             "publisher_hit": (host_org in publisher_id_set) if host_org else False,
             "via": w.get("_via", "openalex"),
+            "profile_cn": profile_cfg.get("topic_cn") or "",
         })
     return out
 
@@ -740,6 +786,7 @@ def enrich_s2(profile_cfg: dict, papers: list[dict], bucket: str = "reco_s2") ->
         url = p.get("url") or doi_url
 
         out.append({
+            "work_id": p.get("paperId") or p.get("corpusId") or "",
             "title": title,
             "abstract": abstract,
             "publication_year": p.get("year"),
@@ -751,6 +798,7 @@ def enrich_s2(profile_cfg: dict, papers: list[dict], bucket: str = "reco_s2") ->
             "relevance": relevance_score(title, abstract, profile_cfg.get("keywords", [])),
             "bucket": bucket,
             "via": p.get("_via", "official_s2"),
+            "profile_cn": profile_cfg.get("topic_cn") or "",
         })
     return out
 
@@ -1266,6 +1314,9 @@ def attach_fulltext_links(profile_cfg: dict, items: list[dict]) -> list[dict]:
 # -------------------------
 # OpenRouter LLM briefs
 # -------------------------
+LLM_STATUS_READY = "ready"
+LLM_STATUS_PENDING = "pending_llm"
+LLM_STATUS_FAILED = "failed_llm"
 def openrouter_headers() -> Optional[dict]:
     key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
     if not key:
@@ -1280,7 +1331,7 @@ def openrouter_headers() -> Optional[dict]:
     return h
 
 
-def openrouter_chat(profile_cfg: dict, messages: list[dict]) -> str:
+def openrouter_chat_json(profile_cfg: dict, messages: list[dict]) -> dict:
     headers = openrouter_headers()
     if not headers:
         raise RuntimeError("OPENROUTER_API_KEY missing")
@@ -1300,19 +1351,31 @@ def openrouter_chat(profile_cfg: dict, messages: list[dict]) -> str:
 
     for attempt in range(retries + 1):
         try:
-            data = http_request_json(
-                "POST",
-                url,
-                headers=headers,
-                data=json.dumps(payload),
-                timeout=timeout,
-                retries=0,
-            )
-            return (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content", "").strip()
-        except Exception as e:
+            r = requests.request("POST", url, headers=headers, data=json.dumps(payload), timeout=timeout)
+            status = r.status_code
+            if status == 429 or status == 408 or (500 <= status < 600):
+                if attempt < retries:
+                    retry_after = _http_retry_after_seconds(r.headers) if status == 429 else None
+                    sleep_s = _http_backoff_seconds(backoff, attempt, retry_after=retry_after)
+                    print(f"OpenRouter retryable status={status}; retry in {sleep_s:.1f}s")
+                    time.sleep(sleep_s)
+                    continue
+            if status >= 400:
+                raise RuntimeError(f"OpenRouter status={status} body={r.text[:240]}")
+            data = r.json()
+            content = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content", "").strip()
+            return parse_llm_json(content)
+        except requests.RequestException as e:
             if attempt < retries:
-                sleep_s = backoff * (2 ** attempt)
-                print(f"OpenRouter exception: {e}; retry in {sleep_s}s")
+                sleep_s = _http_backoff_seconds(backoff, attempt)
+                print(f"OpenRouter exception: {e}; retry in {sleep_s:.1f}s")
+                time.sleep(sleep_s)
+                continue
+            raise
+        except ValueError as e:
+            if attempt < retries:
+                sleep_s = _http_backoff_seconds(backoff, attempt)
+                print(f"OpenRouter parse error: {e}; retry in {sleep_s:.1f}s")
                 time.sleep(sleep_s)
                 continue
             raise
@@ -1334,12 +1397,60 @@ def save_llm_cache(cache: dict, path: str):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
+def llm_cache_key(it: dict, profile_cfg: dict) -> str:
+    base = (it.get("work_id") or it.get("doi") or it.get("url") or it.get("title") or "").strip()
+    if not base:
+        return ""
+    model = profile_cfg.get("openrouter_model", "")
+    version = profile_cfg.get("llm_prompt_version", "")
+    return f"{base}|{model}|{version}"
 
-def llm_cache_key(it: dict) -> str:
-    return (it.get("doi") or it.get("url") or it.get("title") or "").strip()
+
+def parse_llm_json(content: str) -> dict:
+    if not content:
+        raise ValueError("empty llm content")
+    raw = content.strip()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("llm output not json")
+        data = json.loads(raw[start:end + 1])
+    if not isinstance(data, dict):
+        raise ValueError("llm output not dict")
+    required = ["one_liner", "method_clues", "metrics", "recommendation"]
+    for k in required:
+        v = (data.get(k) or "").strip() if isinstance(data.get(k), str) else ""
+        if not v:
+            raise ValueError(f"llm json missing field: {k}")
+    return data
 
 
-def build_llm_prompt_cn(it: dict) -> list[dict]:
+def format_llm_brief(brief: dict) -> str:
+    if not isinstance(brief, dict):
+        return ""
+    parts = []
+    mapping = [
+        ("一句话", "one_liner"),
+        ("做了什么", "method_clues"),
+        ("结果/指标", "metrics"),
+        ("建议", "recommendation"),
+        ("注意/局限", "limitations"),
+    ]
+    for label, key in mapping:
+        val = (brief.get(key) or "").strip() if isinstance(brief.get(key), str) else ""
+        if val:
+            parts.append(f"{label}：{val}")
+    return "\n".join(parts)
+
+
+def item_identity(it: dict) -> str:
+    return (it.get("work_id") or it.get("doi") or it.get("url") or it.get("title") or "")[:64]
+
+
+def build_llm_prompt_cn(it: dict, prompt_version: str) -> list[dict]:
     title = (it.get("title") or "").strip()
     abstract = (it.get("abstract") or "").strip()
     venue = (it.get("venue") or "").strip()
@@ -1355,17 +1466,25 @@ def build_llm_prompt_cn(it: dict) -> list[dict]:
         "请只基于我提供的论文元数据与摘要，生成“中文科研简报”。"
         "严禁编造论文中不存在的实验、指标、结论。"
         "若摘要信息不足，请明确写“信息不足/需读全文”。"
-        "风格：像人写的科研简报，讲人话但保持专业。"
+        "输出必须是严格 JSON，不要包含任何额外文本或 Markdown。"
     )
 
-    user = f"""请为下列论文生成中文科研简报（不超过 180~260 中文字），格式固定为：
+    user = f"""请为下列论文生成中文科研简报，输出严格 JSON，格式固定为：
 
-【一句话】……
-【做了什么】……
-【怎么做】……
-【结果/贡献】……
-【局限/注意】……
-【我该怎么用】（结合“结温在线监测/估算”工程链路给一个建议）
+{{
+  "paper_type": "...",
+  "one_liner": "...",
+  "method_clues": "...",
+  "metrics": "...",
+  "recommendation": "...",
+  "limitations": "..."
+}}
+
+说明：
+- paper_type: 综述/方法/实验/系统/理论/数据集/其他
+- metrics: 若无数值请写“摘要未提供/需看全文”
+- recommendation: 给出工程/研究上的可用性建议
+- limitations: 如信息不足需说明
 
 元数据：
 - 标题：{title}
@@ -1376,6 +1495,7 @@ def build_llm_prompt_cn(it: dict) -> list[dict]:
 - 主页：{url}
 - PDF：{pdf if pdf else "无"}
 - 分类桶：{bucket}
+- prompt_version：{prompt_version}
 
 摘要：
 {abstract if abstract else "（无摘要）"}
@@ -1383,60 +1503,190 @@ def build_llm_prompt_cn(it: dict) -> list[dict]:
     return [{"role": "system", "content": sys}, {"role": "user", "content": user}]
 
 
-def llm_brief_cn(profile_cfg: dict, it: dict) -> str:
-    return openrouter_chat(profile_cfg, build_llm_prompt_cn(it))
+def llm_brief_cn(profile_cfg: dict, it: dict) -> dict:
+    prompt_version = profile_cfg.get("llm_prompt_version", "")
+    return openrouter_chat_json(profile_cfg, build_llm_prompt_cn(it, prompt_version))
 
 
-def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> None:
-    if not global_cfg_flat.get("use_llm_brief", False):
+def load_pending_store(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_pending_store(pending: dict, path: str) -> None:
+    if not path:
         return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(pending, f, ensure_ascii=False, indent=2)
 
-    if not openrouter_headers():
-        print("LLM brief enabled but OPENROUTER_API_KEY missing; fallback to rule-based briefs.")
-        return
 
+def pending_record(profile_cfg: dict, it: dict, reason: str, retry_count: int = 0) -> dict:
+    today = dt.date.today().isoformat()
+    return {
+        "profile_cn": it.get("profile_cn") or profile_cfg.get("topic_cn") or "",
+        "item": {
+            "work_id": it.get("work_id") or "",
+            "doi": it.get("doi") or "",
+            "url": it.get("url") or "",
+            "title": it.get("title") or "",
+            "abstract": it.get("abstract") or "",
+            "venue": it.get("venue") or "",
+            "publication_year": it.get("publication_year"),
+            "publication_date": it.get("publication_date"),
+            "cited_by_count": it.get("cited_by_count") or 0,
+            "bucket": it.get("bucket") or "",
+            "pdf_url": it.get("pdf_url") or "",
+        },
+        "first_seen": today,
+        "last_attempt": today,
+        "last_error": reason,
+        "retry_count": retry_count,
+        "prompt_version": profile_cfg.get("llm_prompt_version", ""),
+        "model": profile_cfg.get("openrouter_model", ""),
+    }
+
+
+def prune_pending_store(pending: dict, max_retries: int, max_days: int) -> dict:
+    today = dt.date.today()
+    kept = {}
+    for k, rec in (pending or {}).items():
+        try:
+            first_seen = dt.date.fromisoformat(rec.get("first_seen") or today.isoformat())
+        except Exception:
+            first_seen = today
+        if rec.get("retry_count", 0) >= max_retries:
+            continue
+        if (today - first_seen).days > max_days:
+            continue
+        kept[k] = rec
+    return kept
+
+
+def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
+    stats = {"pending": 0, "ready": 0, "failed": 0}
     max_n = int(global_cfg_flat.get("llm_max_items_per_run", 18))
     cache_path = global_cfg_flat.get("llm_cache_file", "llm_cache.json")
-    cache = load_llm_cache(cache_path)
+    pending_path = global_cfg_flat.get("llm_pending_store", "data/pending_llm.json")
+    max_concurrency = int(global_cfg_flat.get("llm_max_concurrency", 4))
+    max_retries = int(global_cfg_flat.get("llm_pending_max_retries", 5))
+    max_days = int(global_cfg_flat.get("llm_pending_max_days", 7))
 
-    pool = []
+    cache = load_llm_cache(cache_path)
+    pending = prune_pending_store(load_pending_store(pending_path), max_retries, max_days)
+
+    items_by_key: dict[str, dict] = {}
     for lst in lists:
         for it in lst:
-            k = llm_cache_key(it)
+            k = llm_cache_key(it, global_cfg_flat)
             if not k:
                 continue
-            if it.get("brief_cn"):
+            items_by_key[k] = it
+
+    if not global_cfg_flat.get("use_llm_brief", False) or not openrouter_headers():
+        reason = "llm_disabled_or_missing_key"
+        print("LLM brief unavailable; all items queued for pending.")
+        for k, it in items_by_key.items():
+            it["llm_status"] = LLM_STATUS_PENDING
+            it["llm_failure_reason"] = reason
+            pending[k] = pending_record(global_cfg_flat, it, reason, retry_count=pending.get(k, {}).get("retry_count", 0))
+            stats["pending"] += 1
+        save_pending_store(pending, pending_path)
+        return stats
+
+    for k, it in items_by_key.items():
+        cached = cache.get(k)
+        if isinstance(cached, dict):
+            it["llm_brief"] = cached
+            it["llm_status"] = LLM_STATUS_READY
+            stats["ready"] += 1
+
+    def enqueue_from_pending() -> list[tuple[str, dict, dict]]:
+        out = []
+        for k, rec in pending.items():
+            item = items_by_key.get(k) or dict(rec.get("item") or {})
+            out.append((k, item, rec))
+        return out
+
+    def enqueue_new_items() -> list[tuple[str, dict, dict]]:
+        out = []
+        for k, it in items_by_key.items():
+            if it.get("llm_status") == LLM_STATUS_READY:
                 continue
-            if k in cache and (cache[k] or "").strip():
-                it["brief_cn"] = cache[k]
+            if k in pending:
                 continue
+            out.append((k, it, {}))
+        return out
 
-            cites = safe_int(it.get("cited_by_count", 0), 0)
-            rel = safe_int(it.get("relevance", 0), 0)
-            score = (int(cites ** 0.5) * 10) + (rel * 8)
-            pool.append((score, it))
+    queue = enqueue_from_pending() + enqueue_new_items()
+    queue = queue[:max_n]
+    print(f"LLM briefs: need_generate={len(queue)} max_per_run={max_n}")
+    queued_keys = {k for k, _, _ in queue}
+    for k, it in items_by_key.items():
+        if it.get("llm_status") == LLM_STATUS_READY:
+            continue
+        if k in queued_keys:
+            continue
+        it["llm_status"] = LLM_STATUS_PENDING
+        it["llm_failure_reason"] = "deferred_for_next_run"
+        prev = pending.get(k, {})
+        pending[k] = pending_record(global_cfg_flat, it, "deferred_for_next_run", retry_count=prev.get("retry_count", 0))
+        stats["pending"] += 1
 
-    pool.sort(key=lambda x: x[0], reverse=True)
-    picked = [it for _, it in pool[:max_n]]
-
-    print(f"LLM briefs: need_generate={len(picked)} max_per_run={max_n}")
-
-    for idx, it in enumerate(picked, 1):
-        k = llm_cache_key(it)
+    def worker(k: str, it: dict) -> tuple[str, Optional[dict], Optional[str]]:
         try:
             brief = llm_brief_cn(global_cfg_flat, it)
-            if not brief.strip():
-                brief = human_brief_cn(it.get("title", ""), it.get("abstract", ""))
-            it["brief_cn"] = brief
-            cache[k] = brief
-            print(f"LLM briefs: ok {idx}/{len(picked)} key={k[:32]}")
+            return k, brief, None
         except Exception as e:
-            print(f"LLM briefs: failed key={k[:32]} err={e}; fallback to rule-based")
-            it["brief_cn"] = human_brief_cn(it.get("title", ""), it.get("abstract", ""))
+            return k, None, str(e)
 
-        time.sleep(0.25)
+    futures = []
+    with ThreadPoolExecutor(max_workers=max_concurrency) as ex:
+        for k, it, _ in queue:
+            futures.append(ex.submit(worker, k, it))
+        for idx, fut in enumerate(as_completed(futures), 1):
+            k, brief, err = fut.result()
+            it = items_by_key.get(k)
+            if brief:
+                cache[k] = brief
+                if it is not None:
+                    it["llm_brief"] = brief
+                    it["llm_status"] = LLM_STATUS_READY
+                pending.pop(k, None)
+                stats["ready"] += 1
+                ident = item_identity(it or {})
+                print(f"LLM briefs: ok {idx}/{len(futures)} key={k[:32]} id={ident}")
+            else:
+                if it is not None:
+                    it["llm_status"] = LLM_STATUS_PENDING
+                    it["llm_failure_reason"] = err or "llm_failed"
+                prev = pending.get(k, {})
+                retry_count = int(prev.get("retry_count", 0)) + 1
+                pending[k] = pending_record(global_cfg_flat, it or prev.get("item") or {}, err or "llm_failed", retry_count=retry_count)
+                stats["pending"] += 1
+                ident = item_identity(it or {})
+                print(f"LLM briefs: failed key={k[:32]} id={ident} err={err} retry={retry_count}")
 
     save_llm_cache(cache, cache_path)
+    save_pending_store(pending, pending_path)
+    return stats
+
+
+def filter_ready_items(items: list[dict]) -> Tuple[list[dict], int]:
+    ready = []
+    pending = 0
+    for it in items or []:
+        if it.get("llm_status") == LLM_STATUS_READY and it.get("llm_brief"):
+            ready.append(it)
+        else:
+            pending += 1
+    return ready, pending
 
 
 # -------------------------
@@ -1533,7 +1783,7 @@ def conflict_check(profile_cfg: dict, seed_works: list[dict]) -> Tuple[bool, dic
 
 
 # -------------------------
-# HTML builder (kept similar, uses it["brief_cn"] if exists)
+# HTML builder (kept similar, uses it["llm_brief"] only)
 # -------------------------
 def build_html(
     profile_cfg: dict,
@@ -1652,11 +1902,9 @@ def build_html(
 
     def card(it: dict) -> str:
         title = (it.get("title") or "").strip()
-        abstract = (it.get("abstract") or "").strip()
-
-        brief_src = (it.get("brief_cn") or "").strip()
+        brief_src = format_llm_brief(it.get("llm_brief"))
         if not brief_src:
-            brief_src = human_brief_cn(title, abstract)
+            return ""
 
         brief_html = (
             brief_src.replace("&", "&amp;")
@@ -2076,6 +2324,7 @@ def main():
 
     # 3) Render HTML blocks + mark seen
     all_profile_blocks = []
+    pending_total = 0
     for r in results:
         profile_cfg = r.profile_cfg
 
@@ -2108,13 +2357,30 @@ def main():
             print(f"[{profile_cfg['topic_cn']}] merge tracks: pub_latest A={len(r.track_a['pub_latest'])} B={len(r.track_b['pub_latest'])} -> {len(merged_pub_latest)}")
             print(f"[{profile_cfg['topic_cn']}] merge tracks: pub_classic A={len(r.track_a['pub_classic'])} B={len(r.track_b['pub_classic'])} -> {len(merged_pub_classic)}")
 
+        merged_latest, p = filter_ready_items(merged_latest)
+        pending_total += p
+        merged_classic, p = filter_ready_items(merged_classic)
+        pending_total += p
+        merged_pub_latest, p = filter_ready_items(merged_pub_latest)
+        pending_total += p
+        merged_pub_classic, p = filter_ready_items(merged_pub_classic)
+        pending_total += p
+        reco_s2_ready, p = filter_ready_items(r.seeds_side["reco_s2"])
+        pending_total += p
+        reco_oa_ready, p = filter_ready_items(r.seeds_side["reco_oa"])
+        pending_total += p
+        graph_ref_ready, p = filter_ready_items(r.seeds_side["graph_ref_classic"])
+        pending_total += p
+        graph_cited_ready, p = filter_ready_items(r.seeds_side["graph_citedby_keyfollow"])
+        pending_total += p
+
         html_a = build_html(
             profile_cfg,
             merged_latest, merged_classic,
-            r.seeds_side["reco_s2"], r.seeds_side["reco_oa"],
+            reco_s2_ready, reco_oa_ready,
             merged_pub_latest, merged_pub_classic,
             r.pub_map,
-            r.seeds_side["graph_ref_classic"], r.seeds_side["graph_citedby_keyfollow"]
+            graph_ref_ready, graph_cited_ready
         )
         body_a = strip_email_body(html_a)
 
@@ -2130,7 +2396,7 @@ def main():
         mark_seen(
             seen, today_str,
             merged_latest, merged_classic, merged_pub_latest, merged_pub_classic,
-            r.seeds_side["reco_s2"], r.seeds_side["reco_oa"], r.seeds_side["graph_ref_classic"], r.seeds_side["graph_citedby_keyfollow"],
+            reco_s2_ready, reco_oa_ready, graph_ref_ready, graph_cited_ready,
         )
 
     merged_body = "\n".join(all_profile_blocks)
@@ -2161,6 +2427,7 @@ def main():
 
         <div style="margin-top:16px;color:#9CA3AF;font-size:12px;line-height:18px;padding:0 2px;">
           提示：冲突检测是启发式；建议你把 seeds 放在对应 profile 下，避免跨主题混用。
+          {f"<div>本期有 {pending_total} 条因生成失败已延后，下期优先补齐。</div>" if pending_total > 0 else ""}
         </div>
       </div>
     </body>
