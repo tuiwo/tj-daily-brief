@@ -47,6 +47,8 @@ RUN_STATS = {
     "openrouter_parse_errors": 0,
 }
 
+OPENALEX_ENABLED = True
+
 
 # -------------------------
 # Small utils
@@ -89,8 +91,6 @@ def validate_config(cfg_raw: dict, cfg_flat: dict) -> None:
         errors.append("llm.use_llm_brief must be true (LLM-only output required).")
     if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
         errors.append("Missing OPENROUTER_API_KEY (required for LLM-only output).")
-    if not (os.getenv("OPENALEX_API_KEY") or "").strip():
-        errors.append("Missing OPENALEX_API_KEY (recommended; OpenAlex requires API key).")
     if not (os.getenv("S2_API_KEY") or "").strip():
         print("[WARN] S2_API_KEY missing: S2 enhancements disabled.")
     if errors:
@@ -412,6 +412,8 @@ def reconstruct_abstract(inv_idx):
     return " ".join(pos2word[i] for i in sorted(pos2word))
 
 def openalex_get(params: dict, mailto: str = "", debug: Optional[dict] = None) -> dict:
+    if not OPENALEX_ENABLED:
+        return {}
     params = openalex_apply_auth(params, mailto=mailto)
     RUN_STATS["openalex_requests"] += 1
     data = http_request_json("GET", "https://api.openalex.org/works", params=params, timeout=60, retries=3, backoff_sec=3)
@@ -438,6 +440,8 @@ def openalex_get(params: dict, mailto: str = "", debug: Optional[dict] = None) -
 
 def openalex_get_work_by_id(openalex_id: str, mailto: str = "") -> Optional[dict]:
     if not openalex_id:
+        return None
+    if not OPENALEX_ENABLED:
         return None
     oid = openalex_id.strip()
     if oid.startswith("https://openalex.org/"):
@@ -1238,7 +1242,8 @@ def fetch_s2_recommendations_from_seeds(profile_cfg: dict, pos_path: Path, neg_p
     base_backoff = int(profile_cfg.get("s2_backoff_sec", 3))
 
     if not (os.getenv("S2_API_KEY") or "").strip():
-        print("[WARN] S2_API_KEY missing: using unauthenticated mode (slow/limited).")
+        print("[INFO] S2_API_KEY missing: using unauthenticated mode (slow/limited).")
+        set_profile_debug(profile_cfg, "s2_auth", "unauthenticated")
 
     for attempt in range(retries + 1):
         try:
@@ -1946,6 +1951,8 @@ def build_html(
         debug_lines.append(f"pub_latest_status={dbg.get('pub_latest_status')}")
     if dbg.get("seeds_track_status"):
         debug_lines.append(str(dbg.get("seeds_track_status")))
+    if dbg.get("s2_auth"):
+        debug_lines.append(f"s2_auth={dbg.get('s2_auth')}")
     debug_status = " / ".join(debug_lines)
 
     def tag_pill(text: str, tone: str = "neutral") -> str:
@@ -2448,6 +2455,16 @@ def main():
         if not (os.getenv(k) or "").strip():
             raise RuntimeError(f"Missing env var: {k}")
 
+    global OPENALEX_ENABLED
+    openalex_key = (os.getenv("OPENALEX_API_KEY") or "").strip()
+    if not openalex_key:
+        OPENALEX_ENABLED = False
+        cfg["openalex_enabled"] = False
+        print("OpenAlex 已禁用：缺少 OPENALEX_API_KEY；自 2026-02-13 起 OpenAlex 将要求 API key。")
+        print("请参见 README.md: OpenAlex API key")
+    else:
+        cfg["openalex_enabled"] = True
+
     profiles = cfg_raw.get("profiles", [])
     if not profiles:
         raise RuntimeError("config.yml missing profiles (list).")
@@ -2621,6 +2638,9 @@ def main():
             本邮件按 profiles 分区汇总。若某主题触发冲突检测，将合并 profile query 与 seeds 自动 query 的结果展示。
           </div>
           {summary_html}
+          {("<div style='margin-top:8px;color:#9A3412;font-size:12.5px;'>"
+            "OpenAlex 已禁用：缺少 OPENALEX_API_KEY；自 2026-02-13 起 OpenAlex 将要求 API key。"
+            " 见 README.md: OpenAlex API key</div>") if not cfg.get("openalex_enabled", True) else ""}
         </div>
 
         <div style="margin-top:14px;"></div>
