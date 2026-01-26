@@ -555,6 +555,7 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
     windows = [int(profile_cfg.get("latest_days", 30)), 90, 180, 365]
     seen_windows = set()
     windows = [w for w in windows if not (w in seen_windows or seen_windows.add(w))]
+    set_profile_debug(profile_cfg, "latest_backoff_steps", [])
 
     latest = []
     latest_filter = ""
@@ -575,7 +576,11 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
         latest_count = safe_int(meta.get("count", 0), 0)
         if latest_count == 0:
             print(f"[OA] latest_backoff window_days={days} meta.count={meta.get('count')} results_len={len(latest)}")
+            steps = profile_cfg.get("debug", {}).get("latest_backoff_steps") or []
+            steps.append(days)
+            set_profile_debug(profile_cfg, "latest_backoff_steps", steps)
         if len(latest) > 0:
+            set_profile_debug(profile_cfg, "latest_window_days", days)
             break
         if latest_count == 0:
             probe_search = openalex_get(
@@ -612,6 +617,7 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
                     else:
                         latest = fallback_results
                         set_profile_debug(profile_cfg, "latest_status", "empty_due_to_combo_filter; fallback=date_filter_skipped")
+                    set_profile_debug(profile_cfg, "latest_window_days", days)
                     break
 
     if len(latest) == 0:
@@ -2116,6 +2122,32 @@ def build_html(
       </div>
     """
 
+    latest_empty_note = ""
+    if not latest:
+        dbg = profile_cfg.get("debug") or {}
+        latest_window = dbg.get("latest_window_days") or profile_cfg.get("latest_days")
+        steps = dbg.get("latest_backoff_steps") or []
+        steps_str = "→".join(str(x) for x in steps if x)
+        status = (dbg.get("latest_status") or "").strip()
+        lines = []
+        if steps_str:
+            lines.append(f"已自动扩大时间窗至 {latest_window} 天仍为空。")
+        if "fallback=client_side_publisher_filter" in status:
+            lines.append("组合过滤疑似过严，已改用客户端 publisher 过滤。")
+        elif "fallback=publisher_filter_skipped" in status or "fallback=date_filter_skipped" in status:
+            lines.append("组合过滤疑似过严，已跳过 publisher 过滤。")
+        elif "fallback=client_side_date_filter" in status:
+            lines.append("组合过滤疑似过严，已改用客户端日期过滤。")
+        if not lines:
+            lines.append("当前检索窗口内未匹配到最新条目。")
+        lines.append("建议：可在 seeds_positive 补充更具体关键词以提高命中。")
+        latest_empty_note = f"""
+        <div style="margin:10px 0 4px;padding:12px 14px;border:1px dashed #E5E7EB;border-radius:14px;color:#6B7280;
+                    background:#FAFAFA;font-size:13px;line-height:18px;">
+          { "<br>".join(lines) }
+        </div>
+        """
+
     sections_html = ""
     if all_count > 0:
         sections_html = f"""
@@ -2139,7 +2171,8 @@ def build_html(
 
         {section(f"🆕 最新进展（全域 · 近 {profile_cfg['latest_days']} 天）",
                  "全域关键词检索：用于补齐图谱/出版商池没覆盖到的最新进展。",
-                 latest,"今日未抓到足够匹配的最新条目。")}
+                 latest,"")}
+        {latest_empty_note}
 
         {section("🏛️ 经典/高影响力（全域）","全域关键词检索：用引用数主导补齐经典工作。",
                  classic,"今日未抓到足够匹配的经典条目。")}
