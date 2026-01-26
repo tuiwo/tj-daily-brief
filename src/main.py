@@ -92,7 +92,7 @@ def validate_config(cfg_raw: dict, cfg_flat: dict) -> None:
     if not (os.getenv("OPENROUTER_API_KEY") or "").strip():
         errors.append("Missing OPENROUTER_API_KEY (required for LLM-only output).")
     if not (os.getenv("S2_API_KEY") or "").strip():
-        print("[WARN] S2_API_KEY missing: S2 enhancements disabled.")
+        print("[INFO] S2_API_KEY missing: using unauthenticated mode (may be slower/limited).")
     if errors:
         raise RuntimeError("Config validation failed: " + " | ".join(errors))
 
@@ -561,12 +561,24 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
     windows = [w for w in windows if not (w in seen_windows or seen_windows.add(w))]
     set_profile_debug(profile_cfg, "latest_backoff_steps", [])
 
+    def filter_future_latest(works: list[dict]) -> list[dict]:
+        cutoff = today + dt.timedelta(days=1)
+        out = []
+        for w in works or []:
+            pdate = (w.get("publication_date") or "").strip()
+            if not pdate:
+                out.append(w)
+                continue
+            if pdate <= cutoff.isoformat():
+                out.append(w)
+        return out
+
     latest = []
     latest_filter = ""
     latest_data = {}
     for i, days in enumerate(windows):
         from_date = (today - dt.timedelta(days=int(days))).isoformat()
-        latest_filter = f"from_publication_date:{from_date}"
+        latest_filter = f"from_publication_date:{from_date},to_publication_date:{today.isoformat()}"
         if (os.getenv("DEBUG", "") or "").strip():
             print(f"[{profile_cfg.get('topic_cn','')}] OA latest params: from_date={from_date} query={query}")
             print(f"[{profile_cfg.get('topic_cn','')}] OA latest filter: {latest_filter}")
@@ -575,7 +587,7 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
             "filter": latest_filter,
             "sort": "publication_date:desc",
         } ,mailto=mailto, debug={"kind": "latest", "profile": profile_cfg.get("topic_cn","")})
-        latest = latest_data.get("results", [])
+        latest = filter_future_latest(latest_data.get("results", []))
         meta = latest_data.get("meta") or {}
         latest_count = safe_int(meta.get("count", 0), 0)
         if latest_count == 0:
@@ -601,11 +613,11 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
             filter_count = safe_int((probe_filter.get("meta") or {}).get("count", 0), 0)
             if search_count > 0 and filter_count > 0:
                 fallback_data = openalex_get(
-                    {**base, "sort": "publication_date:desc"},
+                    {**base, "filter": f"to_publication_date:{today.isoformat()}", "sort": "publication_date:desc"},
                     mailto=mailto,
                     debug={"kind": "latest_fallback_combo_zero", "profile": profile_cfg.get("topic_cn","")},
                 )
-                fallback_results = fallback_data.get("results", []) or []
+                fallback_results = filter_future_latest(fallback_data.get("results", []) or [])
                 if fallback_results:
                     filtered = []
                     has_date = False
@@ -637,7 +649,7 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
                 mailto=mailto,
                 debug={"kind": "latest_fallback_no_search", "profile": profile_cfg.get("topic_cn","")},
             )
-            fallback_works = no_search_data.get("results", []) or []
+            fallback_works = filter_future_latest(no_search_data.get("results", []) or [])
             fetched = len(fallback_works)
             qset = set(kept_tokens)
             scored = []
