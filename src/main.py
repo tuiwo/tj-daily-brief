@@ -572,21 +572,47 @@ def fetch_latest_and_classic(profile_cfg: dict, mailto: str) -> Tuple[list[dict]
         } ,mailto=mailto, debug={"kind": "latest", "profile": profile_cfg.get("topic_cn","")})
         latest = latest_data.get("results", [])
         meta = latest_data.get("meta") or {}
-        if len(latest) == 0:
+        latest_count = safe_int(meta.get("count", 0), 0)
+        if latest_count == 0:
             print(f"[OA] latest_backoff window_days={days} meta.count={meta.get('count')} results_len={len(latest)}")
         if len(latest) > 0:
             break
-        if i == 0 and (os.getenv("DEBUG", "") or "").strip():
-            openalex_get(
+        if latest_count == 0:
+            probe_search = openalex_get(
                 {"search": query, "per_page": 1},
                 mailto=mailto,
                 debug={"kind": "latest_probe_search", "profile": profile_cfg.get("topic_cn","")},
             )
-            openalex_get(
+            probe_filter = openalex_get(
                 {"filter": latest_filter, "per_page": 1},
                 mailto=mailto,
                 debug={"kind": "latest_probe_filter", "profile": profile_cfg.get("topic_cn","")},
             )
+            search_count = safe_int((probe_search.get("meta") or {}).get("count", 0), 0)
+            filter_count = safe_int((probe_filter.get("meta") or {}).get("count", 0), 0)
+            if search_count > 0 and filter_count > 0:
+                fallback_data = openalex_get(
+                    {**base, "sort": "publication_date:desc"},
+                    mailto=mailto,
+                    debug={"kind": "latest_fallback_combo_zero", "profile": profile_cfg.get("topic_cn","")},
+                )
+                fallback_results = fallback_data.get("results", []) or []
+                if fallback_results:
+                    filtered = []
+                    has_date = False
+                    for w in fallback_results:
+                        pdate = (w.get("publication_date") or "").strip()
+                        if pdate:
+                            has_date = True
+                        if not pdate or pdate >= from_date:
+                            filtered.append(w)
+                    if has_date:
+                        latest = filtered
+                        set_profile_debug(profile_cfg, "latest_status", "empty_due_to_combo_filter; fallback=client_side_date_filter")
+                    else:
+                        latest = fallback_results
+                        set_profile_debug(profile_cfg, "latest_status", "empty_due_to_combo_filter; fallback=date_filter_skipped")
+                    break
 
     if len(latest) == 0:
         probe_data = openalex_get(
@@ -994,17 +1020,43 @@ def fetch_publisher_pools(profile_cfg: dict, mailto: str, publisher_ids: list[st
         "sort": "cited_by_count:desc",
     }, mailto=mailto, debug={"kind": "pub_latest", "profile": profile_cfg.get("topic_cn","")})
     pub_latest = pub_latest_data.get("results", [])
-    if (os.getenv("DEBUG", "") or "").strip() and len(pub_latest) == 0:
-        openalex_get(
+    pub_latest_count = safe_int((pub_latest_data.get("meta") or {}).get("count", 0), 0)
+    if pub_latest_count == 0:
+        probe_search = openalex_get(
             {"search": query, "per_page": 1},
             mailto=mailto,
             debug={"kind": "pub_latest_probe_search", "profile": profile_cfg.get("topic_cn","")},
         )
-        openalex_get(
+        probe_filter = openalex_get(
             {"filter": pub_latest_filter, "per_page": 1},
             mailto=mailto,
             debug={"kind": "pub_latest_probe_filter", "profile": profile_cfg.get("topic_cn","")},
         )
+        search_count = safe_int((probe_search.get("meta") or {}).get("count", 0), 0)
+        filter_count = safe_int((probe_filter.get("meta") or {}).get("count", 0), 0)
+        if search_count > 0 and filter_count > 0:
+            fallback_filter = f"from_publication_date:{from_date}"
+            fallback_data = openalex_get(
+                {**base, "filter": fallback_filter, "sort": "cited_by_count:desc"},
+                mailto=mailto,
+                debug={"kind": "pub_latest_fallback_combo_zero", "profile": profile_cfg.get("topic_cn","")},
+            )
+            fallback_results = fallback_data.get("results", []) or []
+            pub_set = set(publisher_ids or [])
+            filtered = []
+            has_host = False
+            for w in fallback_results:
+                host_org = ((w.get("primary_location") or {}).get("source") or {}).get("host_organization") or ""
+                if host_org:
+                    has_host = True
+                if not host_org or host_org in pub_set:
+                    filtered.append(w)
+            if not has_host:
+                pub_latest = fallback_results
+                set_profile_debug(profile_cfg, "pub_latest_status", "empty_due_to_combo_filter; fallback=publisher_filter_skipped")
+            else:
+                pub_latest = filtered
+                set_profile_debug(profile_cfg, "pub_latest_status", "empty_due_to_combo_filter; fallback=client_side_publisher_filter")
 
     pub_classic_data = openalex_get({
         **base,
@@ -1804,6 +1856,11 @@ def clean_search_query(raw: str, max_tokens: int = 12) -> Tuple[str, list[str]]:
             break
     return " ".join(kept), kept
 
+
+def set_profile_debug(profile_cfg: dict, key: str, value: str) -> None:
+    dbg = profile_cfg.setdefault("debug", {})
+    dbg[key] = value
+
 def build_seed_query_from_works(seed_works: list[dict], max_terms: int = 12) -> str:
     freq: dict[str, int] = {}
     for w in seed_works or []:
@@ -1875,6 +1932,13 @@ def build_html(
     for name, pid in (pub_map or {}).items():
         pub_lines.append(f"{name} ✓" if pid else f"{name} ✗")
     pub_status = " / ".join(pub_lines) if pub_lines else "（未配置 preferred_publishers）"
+    debug_lines = []
+    dbg = profile_cfg.get("debug") or {}
+    if dbg.get("latest_status"):
+        debug_lines.append(f"latest_status={dbg.get('latest_status')}")
+    if dbg.get("pub_latest_status"):
+        debug_lines.append(f"pub_latest_status={dbg.get('pub_latest_status')}")
+    debug_status = " / ".join(debug_lines)
 
     def tag_pill(text: str, tone: str = "neutral") -> str:
         bg = {"neutral": "#F3F4F6", "good": "#ECFDF3", "warn": "#FFF7ED"}.get(tone, "#F3F4F6")
@@ -2101,9 +2165,10 @@ def build_html(
           <div style="margin-top:12px;">{top_stats_html}</div>
 
           <div style="margin-top:14px;color:#6B7280;font-size:12.5px;line-height:18px;">
-            <div>数据源：OpenAlex（检索/引用图谱/related_works） + Semantic Scholar（或 AI4Scholar 代理）。</div>
+            <div>数据源：OpenAlex（检索/引用图谱/related_works） + Semantic Scholar（S2）。</div>
             <div>出版商池：按 primary_location.source.host_organization 过滤，增强 IEEE / Elsevier / Springer / Wiley 覆盖。</div>
             <div>出版商识别：{pub_status}</div>
+            {f"<div>调试：{debug_status}</div>" if debug_status else ""}
           </div>
         </div>
 
