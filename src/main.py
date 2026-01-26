@@ -1432,7 +1432,7 @@ def format_llm_brief(brief: dict) -> str:
         return ""
     if brief.get("source") == "abstract_fallback":
         summary = (brief.get("summary") or "").strip()
-        note = "（LLM摘要生成失败，已回退为原文摘要）"
+        note = "（摘要回退）"
         return f"{note}\n{summary}" if summary else f"{note}\nNo abstract available."
     parts = []
     mapping = [
@@ -1622,11 +1622,14 @@ def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
         reason = "llm_disabled_or_missing_key"
         print("LLM brief unavailable; all items queued for pending.")
         for k, it in items_by_key.items():
-            it["llm_status"] = LLM_STATUS_PENDING
+            it["llm_status"] = LLM_STATUS_READY
             it["llm_failure_reason"] = reason
-            it["llm_failure_type"] = reason
-            pending[k] = pending_record(global_cfg_flat, it, reason, retry_count=pending.get(k, {}).get("retry_count", 0))
-            stats["pending"] += 1
+            it["llm_failure_type"] = "llm_http_error"
+            it["llm_brief"] = build_fallback_brief(it, "llm_http_error")
+            it["brief_text"] = format_llm_brief(it["llm_brief"])
+            it["brief_source"] = "abstract" if (it.get("abstract") or "").strip() else "title"
+            it["brief_status"] = "fallback"
+            stats["fallback"] += 1
         save_pending_store(pending, pending_path)
         return stats
 
@@ -1635,6 +1638,9 @@ def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
         if isinstance(cached, dict):
             it["llm_brief"] = cached
             it["llm_status"] = LLM_STATUS_READY
+            it["brief_text"] = format_llm_brief(cached)
+            it["brief_source"] = "llm"
+            it["brief_status"] = "ok"
             stats["ready"] += 1
 
     def enqueue_from_pending() -> list[tuple[str, dict, dict]]:
@@ -1663,12 +1669,15 @@ def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
             continue
         if k in queued_keys:
             continue
-        it["llm_status"] = LLM_STATUS_PENDING
-        it["llm_failure_reason"] = "deferred_for_next_run"
-        it["llm_failure_type"] = "deferred_for_next_run"
-        prev = pending.get(k, {})
-        pending[k] = pending_record(global_cfg_flat, it, "deferred_for_next_run", retry_count=prev.get("retry_count", 0))
-        stats["pending"] += 1
+        it["llm_status"] = LLM_STATUS_READY
+        it["llm_failure_reason"] = "llm_deferred"
+        it["llm_failure_type"] = "llm_deferred"
+        it["llm_brief"] = build_fallback_brief(it, "llm_deferred")
+        it["brief_text"] = format_llm_brief(it["llm_brief"])
+        it["brief_source"] = "abstract" if (it.get("abstract") or "").strip() else "title"
+        it["brief_status"] = "fallback"
+        it["brief_error"] = "deferred_for_next_run"
+        stats["fallback"] += 1
 
     def worker(k: str, it: dict) -> tuple[str, Optional[dict], Optional[str], Optional[str]]:
         try:
@@ -1691,38 +1700,58 @@ def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
                 if it is not None:
                     it["llm_brief"] = brief
                     it["llm_status"] = LLM_STATUS_READY
+                    it["brief_text"] = format_llm_brief(brief)
+                    it["brief_source"] = "llm"
+                    it["brief_status"] = "ok"
                 pending.pop(k, None)
                 stats["ready"] += 1
                 ident = item_identity(it or {})
                 print(f"LLM briefs: ok {idx}/{len(futures)} key={k[:32]} id={ident}")
             else:
                 if it is not None:
+                    mapped = {
+                        "timeout": "llm_timeout",
+                        "rate_limited": "llm_http_error",
+                        "http_4xx": "llm_http_error",
+                        "http_5xx": "llm_http_error",
+                        "parse_error": "llm_parse_error",
+                        "unknown_error": "llm_unknown",
+                    }.get(err_type or "unknown_error", "llm_unknown")
                     it["llm_status"] = LLM_STATUS_READY
-                    it["llm_failure_reason"] = err_msg or "llm_failed"
-                    it["llm_failure_type"] = err_type or "llm_failed"
-                    it["llm_brief"] = build_fallback_brief(it, err_type or "llm_failed")
+                    it["llm_failure_reason"] = err_msg or mapped
+                    it["llm_failure_type"] = mapped
+                    it["llm_brief"] = build_fallback_brief(it, mapped)
+                    it["brief_text"] = format_llm_brief(it["llm_brief"])
+                    it["brief_source"] = "abstract" if (it.get("abstract") or "").strip() else "title"
+                    it["brief_status"] = "fallback"
+                    it["brief_error"] = err_msg or mapped
                 prev = pending.get(k, {})
                 retry_count = int(prev.get("retry_count", 0)) + 1
                 pending.pop(k, None)
                 stats["fallback"] += 1
                 ident = item_identity(it or {})
                 print(f"[WARN] LLM briefs: failed key={k[:32]} id={ident} type={err_type} err={err_msg} fallback=abstract")
+                if (os.getenv("DEBUG", "") or "").strip():
+                    print(f"[DEBUG] brief_fallback key={k[:32]} id={ident}")
 
     save_llm_cache(cache, cache_path)
     save_pending_store(pending, pending_path)
     return stats
 
 
-def summarize_llm_items(items: list[dict]) -> tuple[int, int, dict]:
+def summarize_llm_items(items: list[dict]) -> tuple[int, int, dict, int]:
     ready = 0
     failed = 0
     fallback = 0
     reasons: dict[str, int] = {}
     for it in items or []:
-        if it.get("llm_status") == LLM_STATUS_READY and it.get("llm_brief"):
+        has_brief = bool((it.get("brief_text") or "").strip() or it.get("llm_brief"))
+        if has_brief:
             ready += 1
-            if (it.get("llm_brief") or {}).get("source") == "abstract_fallback":
+            if it.get("brief_status") == "fallback" or it.get("brief_source") in ("abstract", "title"):
                 fallback += 1
+                reason = it.get("llm_failure_type") or it.get("llm_failure_reason") or "llm_unknown"
+                reasons[reason] = reasons.get(reason, 0) + 1
         else:
             failed += 1
             reason = it.get("llm_failure_type") or it.get("llm_failure_reason") or "unknown"
@@ -1942,36 +1971,17 @@ def build_html(
 
     def card(it: dict) -> str:
         title = (it.get("title") or "").strip()
-        brief_src = format_llm_brief(it.get("llm_brief"))
+        brief_src = (it.get("brief_text") or "").strip()
         if not brief_src:
-            reason = (it.get("llm_failure_type") or it.get("llm_failure_reason") or "unknown").strip()
-            venue = (it.get("venue") or "Unknown venue").strip()
-            year = it.get("publication_year") or ""
-            doi = (it.get("doi") or "").strip()
-            url = (it.get("url") or "").strip()
+            brief_src = format_llm_brief(it.get("llm_brief"))
+        if not brief_src:
             abstract = (it.get("abstract") or "").strip()
-            snippet = (abstract[:220] + "…") if len(abstract) > 220 else abstract
-            info = html_lib.escape(snippet or "（无摘要）")
-            title_html = html_lib.escape(title if title else "（无标题）")
-            return f"""
-            <div style="margin:12px 0;padding:14px 16px;border:1px dashed #FCA5A5;border-radius:14px;background:#FEF2F2;">
-              <div style="font-size:14px;font-weight:700;color:#991B1B;">LLM 生成失败（原因：{html_lib.escape(reason)}）</div>
-              <div style="margin-top:6px;font-size:14px;color:#111827;">{title_html}</div>
-              <div style="margin-top:6px;color:#6B7280;font-size:13px;">
-                <span>{html_lib.escape(venue)}</span>
-                <span style="margin:0 6px;">·</span>
-                <span>{year}</span>
-              </div>
-              <div style="margin-top:8px;color:#374151;font-size:13px;line-height:18px;">{info}</div>
-              <div style="margin-top:8px;color:#6B7280;font-size:12px;">
-                <span>{html_lib.escape(doi) if doi else ""}</span>
-                <span style="margin:0 6px;">·</span>
-                <a href="{html_lib.escape(url) if url else '#'}" target="_blank" rel="noreferrer" style="color:#6B7280;text-decoration:none;">
-                  {html_lib.escape(url) if url else "无链接"}
-                </a>
-              </div>
-            </div>
-            """
+            if abstract:
+                brief_src = abstract[:420]
+            elif title:
+                brief_src = f"本文研究：{title}"
+            else:
+                return ""
 
         brief_html = (
             brief_src.replace("&", "&amp;")
