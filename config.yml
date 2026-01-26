@@ -22,7 +22,7 @@ config_version: 2
 
 # 运行时间
 timezone: Asia/Shanghai
-send_hour_local: 15
+send_hour_local: 21
 
 # 去重窗口：同一篇论文在 N 天内不重复发
 seen_days_keep: 90
