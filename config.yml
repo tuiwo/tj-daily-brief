@@ -1,32 +1,10 @@
 # =========================
-# 全局设置（与具体领域无关）
+# 需要配置的全局变量
 # =========================
-config_version: 2
 
-timezone: Asia/Shanghai
-send_hour_local: 15
-
-# 去重窗口：同一篇论文在 N 天内不重复发
-seen_days_keep: 30
-
-# 偏向近几天（如果排序逻辑里用到了）
-prefer_recent_days: 180
-
-# OpenAlex：无需 key，但建议配置 OPENALEX_MAILTO 环境变量用于 polite pool
-openalex:
-  per_page: 200   # OpenAlex 单次 per_page 上限通常为 200（超过需分页）
-
-# 语义学者推荐
-use_s2_recommendations: true
-s2:
-  limit: 20
-  retries: 2
-  backoff_sec: 5
-
-# LLM 简报（OpenRouter）
 llm:
   use_llm_brief: true
-  openrouter_model: "google/gemini-2.5-flash-lite"
+  openrouter_model: "google/gemini-2.5-flash-lite" # 在此配置：从OpenRouter调用的模型
   temperature: 0.2
   max_tokens: 520
   timeout_sec: 60
@@ -36,6 +14,32 @@ llm:
   max_items_per_run: 18
   # 缓存
   cache_file: "llm_cache.json"
+
+# =========================
+# 全局设置（与具体领域无关）
+# =========================
+config_version: 2
+
+# 运行时间
+timezone: Asia/Shanghai
+send_hour_local: 15
+
+# 去重窗口：同一篇论文在 N 天内不重复发
+seen_days_keep: 90
+
+# 偏向近几天（如果排序逻辑里用到了）
+prefer_recent_days: 180
+
+# OpenAlex：无需 key，但建议配置 OPENALEX_MAILTO 环境变量用于 polite pool
+openalex:
+  per_page: 200 # OpenAlex 单次 per_page 上限通常为 200（超过需分页）
+
+# 语义学者推荐
+use_s2_recommendations: true
+s2:
+  limit: 20
+  retries: 2
+  backoff_sec: 5
 
 # 冲突检测与兜底展示（跨领域关键词/seed 冲突时）
 conflict_detection:
@@ -50,7 +54,7 @@ conflict_detection:
 seed_query_builder:
   enabled: true
   # 当 profile.search_query 为空或 profile.query.mode=auto 时启用
-  default_mode: "auto"   # auto | explicit
+  default_mode: "auto" # auto | explicit
   # 从 seeds 里抽取多少关键词/短语拼成 query（你实现时可按 title/abstract/keywords/概念抽取）
   max_terms: 14
   # 可选：生成 query 时的额外提示词（一般留空即可）
@@ -61,20 +65,16 @@ seed_query_builder:
 # 一封邮件会按 profile 分区展示
 # =========================
 profiles:
-  - id: "power_semiconductor_tj"
+  - id: "power_semiconductor_tj" # 示例ID
     enabled: true
 
     # 分区标题
     title_cn: "功率半导体结温在线监测"
-
-    # ✅ profile 路径：seeds 固定从该目录读取
-    #    profiles/power_tj/seeds_positive.txt
-    #    profiles/power_tj/seeds_negative.txt
     path: "profiles/power_tj"
 
     # 搜索策略：explicit 用你写死的 query；auto 则从 seeds 自动生成
     query:
-      mode: "explicit"   # explicit | auto
+      mode: "explicit" # explicit | auto
       search_query: "junction temperature estimation online monitoring IGBT SiC power module"
       latest_days: 30
 
@@ -147,7 +147,7 @@ profiles:
     path: "profiles/sleep"
 
     query:
-      mode: "explicit"   # 你也可以改成 auto，让 seeds 来带动 query
+      mode: "explicit" # 你也可以改成 auto，让 seeds 来带动 query
       search_query: "sleep neuroscience | polysomnography | sleep architecture | slow wave activity | sleep spindles | hypocretin | VLPO | SCN | circadian glymphatic | memory | consolidation"
       latest_days: 30
 
