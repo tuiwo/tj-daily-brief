@@ -65,7 +65,7 @@ jobs:
         run: python src/main.py
         env:
           DEBUG: "1"
-          STRICT_MODE: "false"
+          STRICT_MODE: "true"
           OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
