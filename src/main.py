@@ -1944,6 +1944,8 @@ def build_html(
         debug_lines.append(f"latest_status={dbg.get('latest_status')}")
     if dbg.get("pub_latest_status"):
         debug_lines.append(f"pub_latest_status={dbg.get('pub_latest_status')}")
+    if dbg.get("seeds_track_status"):
+        debug_lines.append(str(dbg.get("seeds_track_status")))
     debug_status = " / ".join(debug_lines)
 
     def tag_pill(text: str, tone: str = "neutral") -> str:
@@ -2307,14 +2309,21 @@ def run_profile(global_cfg_flat: dict, profile: dict, mailto: str, seen: dict) -
     if pos_path.exists():
         print(f"[{profile_cfg['topic_cn']}] pos_size={pos_path.stat().st_size}")
     else:
-        print(f"[WARN] [{profile_cfg['topic_cn']}] seeds_positive.txt missing; fallback to profile query.")
+        print(f"[INFO] [{profile_cfg['topic_cn']}] seeds_positive.txt missing; fallback to profile query.")
+        pos_path.parent.mkdir(parents=True, exist_ok=True)
+        pos_path.touch()
+        print(f"[INFO] [{profile_cfg['topic_cn']}] created empty seeds_positive.txt")
     if not neg_path.exists():
-        print(f"[WARN] [{profile_cfg['topic_cn']}] seeds_negative.txt missing; negative filter disabled.")
+        print(f"[INFO] [{profile_cfg['topic_cn']}] seeds_negative.txt missing; negative filter disabled.")
+        neg_path.parent.mkdir(parents=True, exist_ok=True)
+        neg_path.touch()
+        print(f"[INFO] [{profile_cfg['topic_cn']}] created empty seeds_negative.txt")
 
     # Build seed_query + conflict detection
     seed_works = fetch_seed_works_brief(mailto, pos_path, limit=int(profile_cfg.get("seeds_query_max_seeds", 10)))
     if not seed_works:
-        print(f"[WARN] [{profile_cfg['topic_cn']}] seeds_positive empty; seeds-based query disabled.")
+        print(f"[INFO] [{profile_cfg['topic_cn']}] seeds_positive empty; seeds-based query disabled.")
+        set_profile_debug(profile_cfg, "seeds_track_status", "seeds track disabled (empty seeds_positive)")
     seed_query = build_seed_query_from_works(seed_works, max_terms=int(profile_cfg.get("seeds_query_max_terms", 12)))
 
     if not (profile_cfg.get("search_query") or "").strip():
