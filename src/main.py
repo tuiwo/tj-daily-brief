@@ -1140,7 +1140,7 @@ def fetch_graph_buckets_from_seeds(profile_cfg: dict, mailto: str, pos_path: Pat
 
 
 # -------------------------
-# Semantic Scholar / AI4Scholar recs
+# Semantic Scholar recs
 # -------------------------
 def s2_headers() -> dict:
     key = (os.getenv("S2_API_KEY") or "").strip()
@@ -1158,87 +1158,9 @@ def doi_to_s2_pid(doi: str) -> str:
     return f"DOI:{d}" if d else ""
 
 
-def ai4s_headers() -> Optional[dict]:
-    key = (os.getenv("AI4SCHOLAR_API_KEY") or "").strip()
-    if not key:
-        return None
-    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-
-
-def fetch_ai4s_recommendations_from_seeds(profile_cfg: dict, pos_path: Path, neg_path: Path) -> Tuple[bool, list[dict]]:
-    headers = ai4s_headers()
-    if not headers:
-        return (False, [])
-
-    pos = load_seed_dois(pos_path)
-    neg = load_seed_dois(neg_path)
-    positive = [doi_to_s2_pid(d) for d in pos if doi_to_s2_pid(d)]
-    negative = [doi_to_s2_pid(d) for d in neg if doi_to_s2_pid(d)]
-    if not positive:
-        return (True, [])
-
-    url = "https://ai4scholar.net/recommendations/v1/papers/"
-    params = {
-        "fields": "title,abstract,year,citationCount,venue,externalIds,url",
-        "limit": int(profile_cfg.get("s2_limit", 20)),
-    }
-    payload = {"positivePaperIds": positive, "negativePaperIds": negative}
-
-    retries = int(profile_cfg.get("s2_retries", 2))
-    base_backoff = int(profile_cfg.get("s2_backoff_sec", 3))
-
-    for attempt in range(retries + 1):
-        try:
-            data = http_request_json(
-                "POST",
-                url,
-                params=params,
-                headers=headers,
-                data=json.dumps(payload),
-                timeout=60,
-                retries=0,  # manual retry below
-            )
-            recs = data.get("recommendedPapers", None)
-            if recs is None:
-                recs = data.get("data", []) or []
-
-            for p in recs:
-                if isinstance(p, dict):
-                    p["_via"] = "ai4scholar"
-            return (True, recs)
-
-        except requests.HTTPError as e:
-            msg = str(e)
-            # retry on 429/5xx handled by caller? Here we do simple backoff by status in text.
-            if attempt < retries:
-                sleep_s = base_backoff * (2 ** attempt)
-                print(f"AI4S: http error {msg}; retry in {sleep_s}s")
-                time.sleep(sleep_s)
-                continue
-            print(f"AI4S: failed; fallback to official S2. err={msg}")
-            return (False, [])
-
-        except Exception as e:
-            if attempt < retries:
-                sleep_s = base_backoff * (2 ** attempt)
-                print(f"AI4S: exception {e}; retry in {sleep_s}s")
-                time.sleep(sleep_s)
-                continue
-            print(f"AI4S: exception {e}; fallback to official S2.")
-            return (False, [])
-
-    return (False, [])
-
-
 def fetch_s2_recommendations_from_seeds(profile_cfg: dict, pos_path: Path, neg_path: Path) -> list[dict]:
     if not profile_cfg.get("use_s2_recommendations", True):
         return []
-
-    # Prefer AI4Scholar if key available
-    ok, recs = fetch_ai4s_recommendations_from_seeds(profile_cfg, pos_path, neg_path)
-    if ok:
-        print(f"AI4S used, recs={len(recs)} (profile={profile_cfg.get('topic_cn')})")
-        return recs
 
     pos = load_seed_dois(pos_path)
     neg = load_seed_dois(neg_path)
@@ -1257,6 +1179,9 @@ def fetch_s2_recommendations_from_seeds(profile_cfg: dict, pos_path: Path, neg_p
     retries = int(profile_cfg.get("s2_retries", 2))
     base_backoff = int(profile_cfg.get("s2_backoff_sec", 3))
 
+    if not (os.getenv("S2_API_KEY") or "").strip():
+        print("[WARN] S2_API_KEY missing: using unauthenticated mode (slow/limited).")
+
     for attempt in range(retries + 1):
         try:
             data = http_request_json(
@@ -1265,7 +1190,7 @@ def fetch_s2_recommendations_from_seeds(profile_cfg: dict, pos_path: Path, neg_p
                 params=params,
                 headers=s2_headers(),
                 data=json.dumps(payload),
-                timeout=60,
+                timeout=20,
                 retries=0,  # manual loop
             )
             recs = data.get("recommendedPapers", []) or []
@@ -1277,7 +1202,7 @@ def fetch_s2_recommendations_from_seeds(profile_cfg: dict, pos_path: Path, neg_p
                 print(f"S2 exception: {e}; retry in {sleep_s}s")
                 time.sleep(sleep_s)
                 continue
-            print(f"S2 exception: {e}; skipping.")
+            print(f"[WARN] S2 exception: {e}; skipping.")
             return []
 
     return []
@@ -1944,8 +1869,7 @@ def build_html(
     def source_badge(it: dict) -> str:
         bucket = it.get("bucket")
         if bucket == "reco_s2":
-            via = it.get("via", "official_s2")
-            return tag_pill("S2猜你喜欢 · AI4Scholar" if via == "ai4scholar" else "S2猜你喜欢 · 官方", "good")
+            return tag_pill("S2猜你喜欢 · 官方", "good")
         if bucket == "reco_oa":
             return tag_pill("OpenAlex · related_works", "neutral")
         if bucket == "pub_latest":
@@ -2395,7 +2319,6 @@ def main():
         print(f"[DEBUG] OPENALEX_API_KEY={'set' if (os.getenv('OPENALEX_API_KEY') or '').strip() else 'missing'}")
         print(f"[DEBUG] OPENALEX_MAILTO={'(missing)' if not oa_mailto else oa_mailto}")
         print(f"[DEBUG] S2_API_KEY={'set' if (os.getenv('S2_API_KEY') or '').strip() else 'missing'}")
-        print(f"[DEBUG] AI4SCHOLAR_API_KEY={'set' if (os.getenv('AI4SCHOLAR_API_KEY') or '').strip() else 'missing'}")
 
 
     

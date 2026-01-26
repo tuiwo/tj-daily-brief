@@ -16,7 +16,7 @@ prefer_recent_days: 180
 openalex:
   per_page: 200   # OpenAlex 单次 per_page 上限通常为 200（超过需分页）
 
-# 语义学者 / ai4scholar 推荐
+# 语义学者推荐
 use_s2_recommendations: true
 s2:
   limit: 20
