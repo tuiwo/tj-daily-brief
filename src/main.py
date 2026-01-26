@@ -1505,6 +1505,10 @@ def parse_llm_json(content: str) -> dict:
 def format_llm_brief(brief: dict) -> str:
     if not isinstance(brief, dict):
         return ""
+    if brief.get("source") == "abstract_fallback":
+        summary = (brief.get("summary") or "").strip()
+        note = "（LLM摘要生成失败，已回退为原文摘要）"
+        return f"{note}\n{summary}" if summary else f"{note}\nNo abstract available."
     parts = []
     mapping = [
         ("标题", "title_cn"),
@@ -1523,6 +1527,23 @@ def format_llm_brief(brief: dict) -> str:
         if joined:
             parts.append(f"要点：{joined}")
     return "\n".join(parts)
+
+
+def build_fallback_brief(it: dict, reason: str) -> dict:
+    abstract = (it.get("abstract") or "").strip()
+    if not abstract:
+        abstract = "No abstract available."
+    return {
+        "title_cn": (it.get("title") or "").strip(),
+        "one_liner": abstract,
+        "why_relevant": "LLM brief failed; fallback to abstract.",
+        "key_takeaways": [abstract],
+        "caveats": "LLM brief failed; fallback to abstract.",
+        "recommended_action": "Manual review recommended.",
+        "summary": abstract,
+        "source": "abstract_fallback",
+        "failure_reason": reason,
+    }
 
 
 def item_identity(it: dict) -> str:
@@ -1651,7 +1672,7 @@ def prune_pending_store(pending: dict, max_retries: int, max_days: int) -> dict:
 
 
 def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
-    stats = {"pending": 0, "ready": 0, "failed": 0}
+    stats = {"pending": 0, "ready": 0, "failed": 0, "fallback": 0}
     max_n = int(global_cfg_flat.get("llm_max_items_per_run", 18))
     cache_path = global_cfg_flat.get("llm_cache_file", "llm_cache.json")
     pending_path = global_cfg_flat.get("llm_pending_store", "data/pending_llm.json")
@@ -1751,15 +1772,16 @@ def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
                 print(f"LLM briefs: ok {idx}/{len(futures)} key={k[:32]} id={ident}")
             else:
                 if it is not None:
-                    it["llm_status"] = LLM_STATUS_PENDING
+                    it["llm_status"] = LLM_STATUS_READY
                     it["llm_failure_reason"] = err_msg or "llm_failed"
                     it["llm_failure_type"] = err_type or "llm_failed"
+                    it["llm_brief"] = build_fallback_brief(it, err_type or "llm_failed")
                 prev = pending.get(k, {})
                 retry_count = int(prev.get("retry_count", 0)) + 1
-                pending[k] = pending_record(global_cfg_flat, it or prev.get("item") or {}, err_type or "llm_failed", retry_count=retry_count)
-                stats["pending"] += 1
+                pending.pop(k, None)
+                stats["fallback"] += 1
                 ident = item_identity(it or {})
-                print(f"LLM briefs: failed key={k[:32]} id={ident} type={err_type} err={err_msg} retry={retry_count}")
+                print(f"[WARN] LLM briefs: failed key={k[:32]} id={ident} type={err_type} err={err_msg} fallback=abstract")
 
     save_llm_cache(cache, cache_path)
     save_pending_store(pending, pending_path)
@@ -1769,15 +1791,18 @@ def apply_llm_briefs(global_cfg_flat: dict, lists: list[list[dict]]) -> dict:
 def summarize_llm_items(items: list[dict]) -> tuple[int, int, dict]:
     ready = 0
     failed = 0
+    fallback = 0
     reasons: dict[str, int] = {}
     for it in items or []:
         if it.get("llm_status") == LLM_STATUS_READY and it.get("llm_brief"):
             ready += 1
+            if (it.get("llm_brief") or {}).get("source") == "abstract_fallback":
+                fallback += 1
         else:
             failed += 1
             reason = it.get("llm_failure_type") or it.get("llm_failure_reason") or "unknown"
             reasons[reason] = reasons.get(reason, 0) + 1
-    return ready, failed, reasons
+    return ready, failed, reasons, fallback
 
 
 # -------------------------
@@ -2469,11 +2494,13 @@ def main():
         ]
         profile_ready = 0
         profile_failed = 0
+        profile_fallback = 0
         profile_reasons: dict[str, int] = {}
         for lst in lists_for_stats:
-            ready, failed, reasons = summarize_llm_items(lst)
+            ready, failed, reasons, fallback = summarize_llm_items(lst)
             profile_ready += ready
             profile_failed += failed
+            profile_fallback += fallback
             for k, v in reasons.items():
                 profile_reasons[k] = profile_reasons.get(k, 0) + v
                 total_reasons[k] = total_reasons.get(k, 0) + v
@@ -2482,6 +2509,7 @@ def main():
             "profile": profile_cfg.get("topic_cn") or "",
             "ready": profile_ready,
             "failed": profile_failed,
+            "fallback": profile_fallback,
             "reasons": profile_reasons,
         })
 
@@ -2515,13 +2543,10 @@ def main():
     build_sha = (os.getenv("GITHUB_SHA", "") or "")[:7]
     run_id = os.getenv("GITHUB_RUN_ID", "")
 
-    if strict_mode and pending_total > 0:
-        print(f"[STRICT] LLM failures detected: failed={pending_total}; exiting with code 2.")
-        for ps in profile_summaries:
-            print(f"[STRICT] profile={ps['profile']} ready={ps['ready']} failed={ps['failed']} reasons={ps['reasons']}")
-        raise SystemExit(2)
-
-    summary_lines = [f"profiles={len(results)} ready={sum(p['ready'] for p in profile_summaries)} failed={pending_total}"]
+    summary_lines = [
+        f"profiles={len(results)} ready={sum(p['ready'] for p in profile_summaries)} "
+        f"fallback={sum(p['fallback'] for p in profile_summaries)} failed={pending_total}"
+    ]
     if total_reasons:
         summary_lines.append("reasons=" + ", ".join(f"{k}:{v}" for k, v in total_reasons.items()))
     summary_lines.append(
@@ -2532,7 +2557,7 @@ def main():
     run_summary = " | ".join(summary_lines)
     print(f"[SUMMARY] {run_summary}")
     for ps in profile_summaries:
-        print(f"[SUMMARY] profile={ps['profile']} ready={ps['ready']} failed={ps['failed']} reasons={ps['reasons']}")
+        print(f"[SUMMARY] profile={ps['profile']} ready={ps['ready']} fallback={ps['fallback']} failed={ps['failed']} reasons={ps['reasons']}")
 
     summary_html = f"""
       <div style="margin-top:10px;color:#6B7280;font-size:12.5px;line-height:18px;">
