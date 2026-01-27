@@ -62,45 +62,31 @@ seed_query_builder:
 # 一封邮件会按 profile 分区展示
 # =========================
 profiles:
-  - id: "power_semiconductor_tj"
+  - id: "example"
     enabled: true
 
     # 分区标题
-    title_cn: "功率半导体结温在线监测"
+    title_cn: "示例"
 
-    # ✅ profile 路径：seeds 固定从该目录读取
+    #    profile 路径：seeds 固定从该目录读取
     #    profiles/power_tj/seeds_positive.txt
     #    profiles/power_tj/seeds_negative.txt
-    path: "profiles/power_tj"
+    path: "profiles/example"
 
     # 搜索策略：explicit 用你写死的 query；auto 则从 seeds 自动生成
     query:
       mode: "explicit"   # explicit | auto
-      search_query: "junction temperature estimation online monitoring IGBT SiC power module"
+      search_query: "online monitoring | power device"
       latest_days: 30
 
     keywords:
       - "junction temperature"
-      - "Tj"
       - "online"
-      - "real-time"
-      - "monitoring"
-      - "estimation"
-      - "TSEP"
-      - "temperature sensitive electrical parameter"
-      - "Vce(sat)"
-      - "Vf"
-      - "Rds(on)"
-      - "electro-thermal"
-      - "thermal impedance"
-      - "IGBT"
-      - "SiC"
-      - "MOSFET"
-      - "power module"
+
 
     exclude_keywords:
-      - "photovoltaic"
-
+      - "Tj"
+      
     # 每个板块取多少条（该 profile 自己控制）
     top:
       latest: 5
@@ -141,56 +127,22 @@ profiles:
       follow_years: 3
       follow_min_cited_by: 10
 
-  - id: "sleep"
+  - id: "example_new"
     enabled: true
 
-    title_cn: "睡眠论文周报"
-    path: "profiles/sleep"
+    title_cn: "新的示例"
+    path: "profiles/example_new"
 
     query:
       mode: "explicit"   # 你也可以改成 auto，让 seeds 来带动 query
-      search_query: "sleep neuroscience | polysomnography | sleep architecture | slow wave activity | sleep spindles | hypocretin | VLPO | SCN | circadian glymphatic | memory | consolidation"
+      search_query: "sleep neuroscience | sleep architecture"
       latest_days: 30
 
     keywords:
       - "sleep science"
       - "sleep neuroscience"
-      - "sleep architecture"
-      - "sleep stages"
-      - "NREM"
-      - "REM"
-      - "slow-wave sleep"
-      - "slow-wave activity"
-      - "slow oscillation"
-      - "delta power"
-      - "sleep spindle"
-      - "K-complex"
-      - "arousal"
-      - "microarousal"
-      - "sleep homeostasis"
-      - "suprachiasmatic nucleus"
-      - "chronotype"
-      - "circadian misalignment"
-      - "polysomnography"
-      - "electroencephalography"
-      - "spectral analysis"
-      - "hypothalamus"
-      - "ventrolateral preoptic area"
-      - "orexin"
-      - "hypocretin"
-      - "locus coeruleus"
-      - "dorsal raphe"
-      - "thalamocortical"
-      - "REM-on"
-      - "REM-off"
-      - "memory consolidation"
-      - "hippocampus"
-      - "synaptic homeostasis"
-      - "glymphatic system"
-      - "CSF-ISF exchange"
-      - "metabolite clearance"
 
-    # ✅ 修复：原来这里是一个空的 "-" 会导致 YAML 解析失败
+
     exclude_keywords: []
 
     top:
