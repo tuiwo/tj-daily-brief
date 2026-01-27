@@ -85,6 +85,15 @@ def should_send_now(cfg: dict) -> bool:
     return now.hour == int(cfg["send_hour_local"])
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    v = (os.getenv(name, "") or "").strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
 def validate_config(cfg_raw: dict, cfg_flat: dict) -> None:
     errors = []
     if not cfg_flat.get("use_llm_brief", False):
@@ -1966,6 +1975,7 @@ def build_html(
     if dbg.get("s2_auth"):
         debug_lines.append(f"s2_auth={dbg.get('s2_auth')}")
     debug_status = " / ".join(debug_lines)
+    show_debug_ui = env_flag("BRIEF_SHOW_DEBUG_UI", False)
 
     def tag_pill(text: str, tone: str = "neutral") -> str:
         bg = {"neutral": "#F3F4F6", "good": "#ECFDF3", "warn": "#FFF7ED"}.get(tone, "#F3F4F6")
@@ -2112,13 +2122,15 @@ def build_html(
         </div>
         """
 
+    show_help_ui = env_flag("BRIEF_SHOW_HELP_UI", False)
+
     def section(title: str, desc: str, items: list[dict], empty_text: str) -> str:
         if not items:
             return ""
         header = f"""
           <div style="margin-top:18px;margin-bottom:6px;">
             <div style="font-size:15px;font-weight:800;color:#111827;line-height:20px;">{title}</div>
-            <div style="margin-top:4px;color:#6B7280;font-size:13px;line-height:18px;">{desc}</div>
+            {f'<div style="margin-top:4px;color:#6B7280;font-size:13px;line-height:18px;">{desc}</div>' if show_help_ui else ''}
           </div>
         """
         body = "".join(card(x) for x in items)
@@ -2198,9 +2210,9 @@ def build_html(
         {section("🏛️ 经典/高影响力（全域）","全域关键词检索：用引用数主导补齐经典工作。",
                  classic,"今日未抓到足够匹配的经典条目。")}
 
-        <div style="margin-top:16px;color:#9CA3AF;font-size:12px;line-height:18px;padding:0 2px;">
+        {f'''<div style="margin-top:16px;color:#9CA3AF;font-size:12px;line-height:18px;padding:0 2px;">
           提示：引用图谱栏目高度依赖 seeds 的质量；建议持续把你认可的“根论文/综述/标志性论文”补进 seeds_positive.txt。
-        </div>
+        </div>''' if show_help_ui else ""}
         """
 
     return f"""
@@ -2222,7 +2234,7 @@ def build_html(
             <div>数据源：OpenAlex（检索/引用图谱/related_works） + Semantic Scholar（S2）。</div>
             <div>出版商池：按 primary_location.source.host_organization 过滤，增强 IEEE / Elsevier / Springer / Wiley 覆盖。</div>
             <div>出版商识别：{pub_status}</div>
-            {f"<div>调试：{debug_status}</div>" if debug_status else ""}
+            {f"<div>调试：{debug_status}</div>" if (show_debug_ui and debug_status) else ""}
           </div>
         </div>
 
@@ -2527,8 +2539,9 @@ def main():
     for r in results:
         profile_cfg = r.profile_cfg
 
+        show_debug_ui = env_flag("BRIEF_SHOW_DEBUG_UI", False)
         conflict_banner = ""
-        if r.conflict and profile_cfg.get("enable_dual_track_on_conflict", True):
+        if show_debug_ui and r.conflict and profile_cfg.get("enable_dual_track_on_conflict", True):
             try:
                 conflict_banner = f"""
                 <div style="margin:10px 0 0;padding:10px 12px;border-radius:12px;border:1px solid #FCD34D;
@@ -2632,7 +2645,7 @@ def main():
       <div style="margin-top:10px;color:#6B7280;font-size:12.5px;line-height:18px;">
         <div><b>本期摘要：</b>{run_summary}</div>
       </div>
-    """
+    """ if show_debug_ui else ""
 
     merged_html = f"""
     <html>
@@ -2646,13 +2659,13 @@ def main():
           <div style="margin-top:6px;color:#6B7280;font-size:13px;line-height:18px;">
             {date_str} · tz={cfg["timezone"]} · sha={build_sha} · run={run_id} · topics={len(results)}
           </div>
-          <div style="margin-top:10px;color:#6B7280;font-size:12.5px;line-height:18px;">
+          {f'''<div style="margin-top:10px;color:#6B7280;font-size:12.5px;line-height:18px;">
             本邮件按 profiles 分区汇总。若某主题触发冲突检测，将合并 profile query 与 seeds 自动 query 的结果展示。
-          </div>
+          </div>''' if env_flag("BRIEF_SHOW_HELP_UI", False) else ""}
           {summary_html}
           {("<div style='margin-top:8px;color:#9A3412;font-size:12.5px;'>"
             "OpenAlex 已禁用：缺少 OPENALEX_API_KEY；自 2026-02-13 起 OpenAlex 将要求 API key。"
-            " 见 README.md: OpenAlex API key</div>") if not cfg.get("openalex_enabled", True) else ""}
+            " 见 README.md: OpenAlex API key</div>") if (show_debug_ui and not cfg.get("openalex_enabled", True)) else ""}
         </div>
 
         <div style="margin-top:14px;"></div>
