@@ -1,8 +1,9 @@
-# tj-daily-brief
+# Random-Research
+Random-Research从设置的主题/关键词/论文出发寻找并总结相关论文，并通过Github Action每天自动发送邮件简报。
+
+Random-Research使用OpenAlex, Semantic Scholar, Unpaywall sources数据库获得某领域/主题的论文，并通过OpenRouter调用大模型进行简要分析，汇总成每日周报自动发送到gmail邮箱。
+
 Daily/weekly research brief generator using OpenAlex, Semantic Scholar (S2), Unpaywall sources and OpenRouter LLM summaries.
-
-使用OpenAlex, Semantic Scholar, Unpaywall sources数据库获得某领域/主题的论文，并通过OpenRouter调用大模型进行简要分析，汇总成每日周报自动发送到gmail邮箱。
-
 ## 邮箱
 本项目默认用 Gmail 通过 SMTP 发送简报邮件；
 为避免直接使用账号登录密码，推荐使用 Gmail App Password（应用专用密码）：
