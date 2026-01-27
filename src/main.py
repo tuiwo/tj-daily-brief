@@ -2654,7 +2654,7 @@ def main():
         <div style="padding:16px 16px;border:1px solid #E7E5E4;border-radius:16px;background:#FFFFFF;
                     box-shadow:0 1px 2px rgba(0,0,0,0.04);">
           <div style="font-size:18px;font-weight:900;color:#111827;line-height:24px;">
-            多主题 · 每日科研简报
+            今日科研简报
           </div>
           <div style="margin-top:6px;color:#6B7280;font-size:13px;line-height:18px;">
             {date_str} · tz={cfg["timezone"]} · sha={build_sha} · run={run_id} · topics={len(results)}
@@ -2681,7 +2681,8 @@ def main():
     </html>
     """
 
-    subject = f"[每日科研简报] 多主题({len(results)}) | {now_local(cfg['timezone']).strftime('%Y-%m-%d')}"
+    date_local = now_local(cfg["timezone"]).strftime("%Y-%m-%d")
+    subject = f"[每日科研简报] {date_local}"
     send_email(subject, merged_html)
 
     save_seen(seen)
