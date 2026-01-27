@@ -1,5 +1,6 @@
 # tj-daily-brief
 Daily/weekly research brief generator using OpenAlex, Semantic Scholar (S2), Unpaywall sources and OpenRouter LLM summaries.
+
 使用OpenAlex, Semantic Scholar, Unpaywall sources数据库获得某领域/主题的论文，并通过OpenRouter调用大模型进行简要分析，汇总成每日周报自动发送到gmail邮箱。
 
 ## 邮箱
@@ -90,7 +91,7 @@ Unpaywall是项目文献数据的主要来源之一，用于获取可用的开�
   - `path` : 指向该主题下存放Seeds论文的文件夹，例如 "profiles/power_tj"，项目执行时会进入仓库的 profiles 文件夹下，找到用户规定的文件夹名称 "power_tj"；在规定的文件夹中，项目会找2个文件 seeds_negative.txt (存放你不想看的论文)和 seeds_positive.txt （存放你感兴趣的论文），从中读取论文的doi；
 - 设置 `path` 以后， profiles 文件夹中还不存在自定义的文件夹，需要手动创建**同名**文件夹，并在该文件夹中手动添加 seeds_positive.txt 和 seeds_negative.txt 文件（如有），可以参考示例文档的结构
 - 在 seeds_positive.txt 中逐行写入你感兴趣的论文doi
-- 在 seeds_negative.txt 中逐行写入你感兴趣的论文doi
+- 在 seeds_negative.txt 中逐行写入你不感兴趣的论文doi
 
 
 ## GitHub Actions secrets
