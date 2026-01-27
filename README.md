@@ -94,6 +94,10 @@ Unpaywall是项目文献数据的主要来源之一，用于获取可用的开�
 - 在 seeds_positive.txt 中逐行写入你感兴趣的论文doi
 - 在 seeds_negative.txt 中逐行写入你不感兴趣的论文doi
 
+### 开启Action
+- 进入仓库的选项 Actions
+- 在左侧选择项目名称 Random-Research
+- 点击右侧Enable workflow
 
 ## GitHub Actions secrets
 Required:
